@@ -1,0 +1,36 @@
+From 11ab588052020ceb3812f031fd70a8dc65357a5c Mon Sep 17 00:00:00 2001
+From: ZjW1nd <zj_w1nd@qq.com>
+Date: Mon, 18 Aug 2025 10:26:17 +0800
+Subject: [PATCH 1/9] [Security]: fix OOB write in smb2_add_iovector via
+ chained PDUs
+
+Root cause: missing bounds check for v->niov against SMB2_MAX_VECTORS (256).
+Trigger: a malicious server can chain PDUs (OPLOCK_BREAK bypasses message_id checks) to repeatedly append iovecs until niov overflows.
+Impact: heap corruption, crash, potential RCE on client.
+Fix: add upper-bound check in smb2_add_iovector() and return the last iovec on overflow.
+
+(cherry picked from commit 5e75eebf922b338cdb548d60cffb3b997d2a12e8)
+---
+ lib/init.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/lib/init.c b/lib/init.c
+index 6ba86dc..07f2d16 100644
+--- a/lib/init.c
++++ b/lib/init.c
+@@ -431,7 +431,11 @@ struct smb2_iovec *smb2_add_iovector(struct smb2_context *smb2,
+                                      void (*free)(void *))
+ {
+         struct smb2_iovec *iov = &v->iov[v->niov];
+-
++        // Add bounds checking
++        if (v->niov >= SMB2_MAX_VECTORS) {
++            smb2_set_error(smb2, "Too many I/O vectors");
++            return (struct smb2_iovec*) &v->iov[SMB2_MAX_VECTORS - 1]; // We dont return NULL to prevent null point deref.
++        }                                                              // I chose the simplest solution here, it can be treated more elegantly.
+         v->iov[v->niov].buf = buf;
+         v->iov[v->niov].len = len;
+         v->iov[v->niov].free = free;
+-- 
+2.56.0
+

@@ -67,6 +67,10 @@ smb2_decode_fileidfulldirectoryinformation(
          * that all other fields also fit within the remainder of the
          * vector.
          */
+        if (vec->len < 80) {
+                smb2_set_error(smb2, "Malformed name in query.\n");
+                return -1;
+        }
         smb2_get_uint32(vec, 60, &name_len);
         if (name_len > 80 + name_len ||
             80 + name_len > vec->len) {
@@ -83,6 +87,10 @@ smb2_decode_fileidfulldirectoryinformation(
         smb2_get_uint64(vec, 72, &fs->file_id);
 
         fs->name = smb2_utf16_to_utf8((uint16_t *)(void *)&vec->buf[80], name_len / 2);
+        if (fs->name == NULL) {
+                smb2_set_error(smb2, "Failed to allocate name in query.\n");
+                return -1;
+        }
 
         smb2_get_uint64(vec, 8, &t);
         smb2_win_to_timeval(t, &fs->creation_time);
@@ -117,6 +125,11 @@ smb2_encode_query_directory_request(struct smb2_context *smb2,
         }
 
         iov = smb2_add_iovector(smb2, &pdu->out, buf, len, free);
+        if (iov == NULL) {
+                smb2_set_error(smb2, "Failed to add iovector for query-directory request");
+                free(name);
+                return -1;
+        }
 
         /* Name */
         if (req->name && req->name[0]) {
@@ -149,6 +162,10 @@ smb2_encode_query_directory_request(struct smb2_context *smb2,
                                         buf,
                                         2 * name->len,
                                         free);
+                if (iov == NULL) {
+                        smb2_set_error(smb2, "Failed to add iovector for query-directory name");
+                        return -1;
+                }
         }
         free(name);
 
@@ -277,6 +294,10 @@ smb2_encode_query_directory_reply(struct smb2_context *smb2,
                                         buf,
                                         len,
                                         free);
+        if (iov == NULL) {
+                smb2_set_error(smb2, "Failed to add iovector for query-directory output buffer");
+                return -1;
+        }
 
         in_offset = 0;
         in_remain = fslen;
@@ -434,9 +455,11 @@ smb2_process_query_directory_fixed(struct smb2_context *smb2,
         smb2_get_uint16(iov, 2, &rep->output_buffer_offset);
         smb2_get_uint32(iov, 4, &rep->output_buffer_length);
         if (rep->output_buffer_length &&
-            (rep->output_buffer_offset + rep->output_buffer_length > smb2->spl)) {
+            ((uint64_t)rep->output_buffer_offset +
+             rep->output_buffer_length > (uint64_t)smb2->spl)) {
                 smb2_set_error(smb2, "Output buffer extends beyond end of "
                                "PDU");
+                pdu->payload = NULL;
                 free(rep);
                 return -1;
         }
@@ -449,6 +472,7 @@ smb2_process_query_directory_fixed(struct smb2_context *smb2,
             (SMB2_QUERY_INFO_REPLY_SIZE & 0xfffe)) {
                 smb2_set_error(smb2, "Output buffer overlaps with "
                                "Query Dir reply header");
+                pdu->payload = NULL;
                 free(rep);
                 return -1;
         }
@@ -508,9 +532,11 @@ smb2_process_query_directory_request_fixed(struct smb2_context *smb2,
         smb2_get_uint32(iov, 28, &req->output_buffer_length);
 
         if (req->file_name_length &&
-            (req->file_name_offset + req->file_name_length > (uint16_t)smb2->spl)) {
+            ((uint32_t)req->file_name_offset +
+             req->file_name_length > smb2->spl)) {
                 smb2_set_error(smb2, "Filename extends beyond end of "
                                "PDU");
+                pdu->payload = NULL;
                 free(req);
                 return -1;
         }
@@ -523,6 +549,7 @@ smb2_process_query_directory_request_fixed(struct smb2_context *smb2,
             (SMB2_QUERY_DIRECTORY_REQUEST_SIZE & 0xfffe)) {
                 smb2_set_error(smb2, "Name buffer overlaps with "
                                "Query Dir request header");
+                pdu->payload = NULL;
                 free(req);
                 return -1;
         }

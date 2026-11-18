@@ -1,0 +1,88 @@
+From e16c274a9ef08f782bebac29fb44037891dbe198 Mon Sep 17 00:00:00 2001
+From: Ronnie Sahlberg <ronniesahlberg@gmail.com>
+Date: Fri, 17 Jul 2026 13:22:09 +1000
+Subject: [PATCH 3/9] Fix memory leaks in lib/socket.c when smb2_add_iovector
+ fails
+
+Add free() calls before returning -1 when smb2_add_iovector fails to add
+an iovector. Previously, allocated memory was not freed on failure paths,
+causing memory leaks in the following error conditions:
+- TRFM payload allocation failure (line 432)
+- PENDING padding allocation failure (line 521)
+- UNKNOWN padding allocation failure (line 574)
+- FIXED payload allocation failure (line 623)
+- VARIABLE tail allocation failure (line 667)
+- PAD allocation failure (line 706)
+- PAD allocation failure (line 754)
+
+All malloc'd buffers now properly freed before error returns.
+
+(cherry picked from commit 39d95961d7bdcdb330a9226d2f74fc40797ea5ee)
+---
+ lib/socket.c | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/lib/socket.c b/lib/socket.c
+index 0241cf0..b2a3ed9 100644
+--- a/lib/socket.c
++++ b/lib/socket.c
+@@ -419,6 +419,7 @@ read_more_data:
+                                         return -1;
+                                 }
+                                 if (smb2_add_iovector(smb2, &smb2->in,tmp,len, free) == NULL) {
++                                        free(tmp);
+                                         smb2_set_error(smb2, "Failed to add iovector for TRFM payload");
+                                         return -1;
+                                 }
+@@ -508,6 +509,7 @@ read_more_data:
+                                         return -1;
+                                 }
+                                 if (smb2_add_iovector(smb2, &smb2->in,tmp, len, free) == NULL) {
++                                        free(tmp);
+                                         return -1;
+                                 }
+                         }
+@@ -583,6 +585,7 @@ read_more_data:
+                         if (smb2_add_iovector(smb2, &smb2->in,
+                                   tmp,
+                                   alen, free) == NULL) {
++                                free(tmp);
+                                 return -1;
+                         }
+                 }
+@@ -627,6 +630,7 @@ read_more_data:
+                                         if (smb2_add_iovector(smb2, &smb2->in,
+                                                   tmp,
+                                                   len, free) == NULL) {
++                                                free(tmp);
+                                                 return -1;
+                                         }
+                                 }
+@@ -666,6 +670,7 @@ read_more_data:
+                                 if (smb2_add_iovector(smb2, &smb2->in,
+                                           tmp,
+                                           len, free) == NULL) {
++                                        free(tmp);
+                                         return -1;
+                                 }
+                         }
+@@ -714,6 +719,7 @@ read_more_data:
+                         if (smb2_add_iovector(smb2, &smb2->in,
+                                               tmp,
+                                               len, free) == NULL) {
++                                free(tmp);
+                                 smb2_set_error(smb2, "Failed to add iovector for PAD");
+                                 return -1;
+                         }
+@@ -1039,7 +1045,7 @@ smb2_service_fd(struct smb2_context *smb2, t_socket fd, int revents)
+                 }
+         }
+ 
+- out:
++  out:
+         if (smb2->timeout) {
+                 smb2_timeout_pdus(smb2);
+         }
+-- 
+2.56.0
+

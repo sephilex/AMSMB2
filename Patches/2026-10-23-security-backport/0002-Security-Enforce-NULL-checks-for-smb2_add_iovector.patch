@@ -1,0 +1,1142 @@
+From a15194e9799635f050bce374330280df470120bd Mon Sep 17 00:00:00 2001
+From: ZjW1nd <zj_w1nd@qq.com>
+Date: Mon, 18 Aug 2025 14:29:10 +0800
+Subject: [PATCH 2/9] [Security]: Enforce NULL-checks for smb2_add_iovector.
+
+This is a better fix for the previous 2 commit. And I also add malloc return value check in smb2_read_data to prevent Null deref.
+
+(cherry picked from commit 883e787426df52dd19206234d7278d46ac997668)
+---
+ lib/init.c                     |  32 +++++----
+ lib/pdu.c                      |  12 +++-
+ lib/smb2-cmd-close.c           |   8 +++
+ lib/smb2-cmd-create.c          |  24 +++++++
+ lib/smb2-cmd-echo.c            |   8 +++
+ lib/smb2-cmd-error.c           |   4 ++
+ lib/smb2-cmd-flush.c           |   7 ++
+ lib/smb2-cmd-ioctl.c           |  12 ++++
+ lib/smb2-cmd-lock.c            |  12 ++++
+ lib/smb2-cmd-logoff.c          |   8 +++
+ lib/smb2-cmd-negotiate.c       |  22 ++++++-
+ lib/smb2-cmd-notify-change.c   |  12 ++++
+ lib/smb2-cmd-oplock-break.c    |  24 +++++++
+ lib/smb2-cmd-query-directory.c |  13 ++++
+ lib/smb2-cmd-query-info.c      |  12 ++++
+ lib/smb2-cmd-read.c            |  22 ++++++-
+ lib/smb2-cmd-session-setup.c   |  16 +++++
+ lib/smb2-cmd-set-info.c        |  31 ++++++++-
+ lib/smb2-cmd-tree-connect.c    |  12 ++++
+ lib/smb2-cmd-tree-disconnect.c |   8 +++
+ lib/smb2-cmd-write.c           |  16 ++++-
+ lib/smb3-seal.c                |   9 ++-
+ lib/socket.c                   | 114 +++++++++++++++++++++++++--------
+ 23 files changed, 385 insertions(+), 53 deletions(-)
+
+diff --git a/lib/init.c b/lib/init.c
+index 07f2d16..2c650c8 100644
+--- a/lib/init.c
++++ b/lib/init.c
+@@ -426,19 +426,25 @@ void smb2_free_iovector(struct smb2_context *smb2, struct smb2_io_vectors *v)
+ }
+ 
+ struct smb2_iovec *smb2_add_iovector(struct smb2_context *smb2,
+-                                     struct smb2_io_vectors *v,
+-                                     uint8_t *buf, size_t len,
+-                                     void (*free)(void *))
+-{
+-        struct smb2_iovec *iov = &v->iov[v->niov];
+-        // Add bounds checking
+-        if (v->niov >= SMB2_MAX_VECTORS) {
+-            smb2_set_error(smb2, "Too many I/O vectors");
+-            return (struct smb2_iovec*) &v->iov[SMB2_MAX_VECTORS - 1]; // We dont return NULL to prevent null point deref.
+-        }                                                              // I chose the simplest solution here, it can be treated more elegantly.
+-        v->iov[v->niov].buf = buf;
+-        v->iov[v->niov].len = len;
+-        v->iov[v->niov].free = free;
++                                    struct smb2_io_vectors *v,
++                                    uint8_t *buf, size_t len,
++                                    void (*free_cb)(void *))
++{
++                struct smb2_iovec *iov;
++                /* Bounds checking */
++                if (v->niov >= SMB2_MAX_VECTORS) {
++                        smb2_set_error(smb2, "Too many I/O vectors");
++                        /* Avoid leaks for caller-provided buffers */
++                        if (free_cb && buf) {
++                                free_cb(buf);
++                        }
++                        return NULL;
++                }
++
++                iov = &v->iov[v->niov];
++                v->iov[v->niov].buf = buf;
++                v->iov[v->niov].len = len;
++                v->iov[v->niov].free = free_cb;
+         v->total_size += len;
+         v->niov++;
+ 
+diff --git a/lib/pdu.c b/lib/pdu.c
+index bb486e9..c2bb628 100644
+--- a/lib/pdu.c
++++ b/lib/pdu.c
+@@ -70,8 +70,10 @@ smb2_pad_to_64bit(struct smb2_context *smb2, struct smb2_io_vectors *v)
+         if ((len & 0x07) == 0) {
+                 return 0;
+         }
+-        if (smb2_add_iovector(smb2, v, &zero_bytes[0], 8 - (len & 0x07), NULL)
+-            == NULL) {
++        if (smb2_add_iovector(smb2, v, 
++                        &zero_bytes[0], 
++                        8 - (len & 0x07), NULL)
++                        == NULL) {
+                 return -1;
+         }
+ 
+@@ -153,7 +155,11 @@ smb2_allocate_pdu(struct smb2_context *smb2, enum smb2_command command,
+         pdu->cb_data = cb_data;
+         pdu->out.niov = 0;
+ 
+-        smb2_add_iovector(smb2, &pdu->out, pdu->hdr, SMB2_HEADER_SIZE, NULL);
++        if (smb2_add_iovector(smb2, &pdu->out, pdu->hdr, SMB2_HEADER_SIZE, NULL) == NULL) {
++                free(pdu);
++                smb2_set_error(smb2, "Too many I/O vectors when adding SMB2 header");
++                return NULL;
++        }
+ 
+         switch (command) {
+         case SMB2_NEGOTIATE:
+diff --git a/lib/smb2-cmd-close.c b/lib/smb2-cmd-close.c
+index d57fa8a..a6897e2 100644
+--- a/lib/smb2-cmd-close.c
++++ b/lib/smb2-cmd-close.c
+@@ -72,6 +72,10 @@ smb2_encode_close_request(struct smb2_context *smb2,
+         }
+ 
+         iov = smb2_add_iovector(smb2, &pdu->out, buf, len, free);
++        if (iov == NULL) {
++                smb2_set_error(smb2, "Failed to add iovector for close request");
++                return -1;
++        }
+ 
+         smb2_set_uint16(iov, 0, SMB2_CLOSE_REQUEST_SIZE);
+         smb2_set_uint16(iov, 2, req->flags);
+@@ -122,6 +126,10 @@ smb2_encode_close_reply(struct smb2_context *smb2,
+         }
+ 
+         iov = smb2_add_iovector(smb2, &pdu->out, buf, len, free);
++        if (iov == NULL) {
++                smb2_set_error(smb2, "Failed to add iovector for close reply");
++                return -1;
++        }
+ 
+         smb2_set_uint16(iov, 0, SMB2_CLOSE_REPLY_SIZE);
+         smb2_set_uint16(iov, 2, rep->flags);
+diff --git a/lib/smb2-cmd-create.c b/lib/smb2-cmd-create.c
+index 4991ed8..58a3e6f 100644
+--- a/lib/smb2-cmd-create.c
++++ b/lib/smb2-cmd-create.c
+@@ -77,6 +77,10 @@ smb2_encode_create_request(struct smb2_context *smb2,
+         }
+ 
+         iov = smb2_add_iovector(smb2, &pdu->out, buf, len, free);
++        if (iov == NULL) {
++                smb2_set_error(smb2, "Failed to add iovector for create request");
++                return -1;
++        }
+ 
+         /* Name */
+         if (req->name && req->name[0]) {
+@@ -134,6 +138,10 @@ smb2_encode_create_request(struct smb2_context *smb2,
+                                         buf,
+                                         len,
+                                         free);
++                if (iov == NULL) {
++                        smb2_set_error(smb2, "Failed to add iovector for create name");
++                        return -1;
++                }
+                 /* Convert '/' to '\' */
+                 for (i = 0; i < name->len; i++) {
+                         smb2_get_uint16(iov, i * 2, &ch);
+@@ -150,6 +158,10 @@ smb2_encode_create_request(struct smb2_context *smb2,
+                 static uint8_t zero[8];
+                 iov = smb2_add_iovector(smb2, &pdu->out,
+                                                 zero, 8, NULL);
++                if (iov == NULL) {
++                        smb2_set_error(smb2, "Failed to add iovector for create empty name padding");
++                        return -1;
++                }
+         }
+         /* Create Context: note there is no encoding, we just pass along */
+         if (req->create_context_length) {
+@@ -165,6 +177,10 @@ smb2_encode_create_request(struct smb2_context *smb2,
+                                         buf,
+                                         len,
+                                         free);
++                if (iov == NULL) {
++                        smb2_set_error(smb2, "Failed to add iovector for create context");
++                        return -1;
++                }
+         }
+ 
+         return 0;
+@@ -212,6 +228,10 @@ smb2_encode_create_reply(struct smb2_context *smb2,
+         }
+ 
+         iov = smb2_add_iovector(smb2, &pdu->out, buf, len, free);
++        if (iov == NULL) {
++                smb2_set_error(smb2, "Failed to add iovector for create reply");
++                return -1;
++        }
+ 
+         smb2_set_uint16(iov, 0, SMB2_CREATE_REPLY_SIZE);
+         smb2_set_uint8(iov, 2, rep->oplock_level);
+@@ -243,6 +263,10 @@ smb2_encode_create_reply(struct smb2_context *smb2,
+                                         buf,
+                                         len,
+                                         free);
++                if (iov == NULL) {
++                        smb2_set_error(smb2, "Failed to add iovector for create reply context");
++                        return -1;
++                }
+         }
+ 
+         return 0;
+diff --git a/lib/smb2-cmd-echo.c b/lib/smb2-cmd-echo.c
+index 68669a5..32571fc 100644
+--- a/lib/smb2-cmd-echo.c
++++ b/lib/smb2-cmd-echo.c
+@@ -70,6 +70,10 @@ smb2_encode_echo_request(struct smb2_context *smb2,
+         }
+ 
+         iov = smb2_add_iovector(smb2, &pdu->out, buf, len, free);
++        if (iov == NULL) {
++                smb2_set_error(smb2, "Failed to add iovector for echo request");
++                return -1;
++        }
+ 
+         smb2_set_uint16(iov, 0, SMB2_ECHO_REQUEST_SIZE);
+ 
+@@ -117,6 +121,10 @@ smb2_encode_echo_reply(struct smb2_context *smb2,
+         }
+ 
+         iov = smb2_add_iovector(smb2, &pdu->out, buf, len, free);
++        if (iov == NULL) {
++                smb2_set_error(smb2, "Failed to add iovector for echo reply");
++                return -1;
++        }
+ 
+         smb2_set_uint16(iov, 0, SMB2_ECHO_REPLY_SIZE);
+         return 0;
+diff --git a/lib/smb2-cmd-error.c b/lib/smb2-cmd-error.c
+index ed798e3..de8d6b2 100644
+--- a/lib/smb2-cmd-error.c
++++ b/lib/smb2-cmd-error.c
+@@ -72,6 +72,10 @@ smb2_encode_error_reply(struct smb2_context *smb2,
+         }
+ 
+         iov = smb2_add_iovector(smb2, &pdu->out, buf, len, free);
++        if (iov == NULL) {
++                smb2_set_error(smb2, "Failed to add iovector for error reply");
++                return -1;
++        }
+ 
+         smb2_set_uint16(iov, 0, SMB2_ERROR_REPLY_SIZE);
+         smb2_set_uint8(iov, 2, rep->error_context_count);
+diff --git a/lib/smb2-cmd-flush.c b/lib/smb2-cmd-flush.c
+index d8a89a7..23ea92e 100644
+--- a/lib/smb2-cmd-flush.c
++++ b/lib/smb2-cmd-flush.c
+@@ -72,6 +72,10 @@ smb2_encode_flush_request(struct smb2_context *smb2,
+         }
+ 
+         iov = smb2_add_iovector(smb2, &pdu->out, buf, len, free);
++        if (iov == NULL) {
++                /* buf freed by add_iovector on failure */
++                return -1;
++        }
+ 
+         smb2_set_uint16(iov, 0, SMB2_FLUSH_REQUEST_SIZE);
+         memcpy(iov->buf + 8, req->file_id, SMB2_FD_SIZE);
+@@ -120,6 +124,9 @@ smb2_encode_flush_reply(struct smb2_context *smb2,
+         }
+ 
+         iov = smb2_add_iovector(smb2, &pdu->out, buf, len, free);
++        if (iov == NULL) {
++                return -1;
++        }
+ 
+         smb2_set_uint16(iov, 0, SMB2_FLUSH_REPLY_SIZE);
+ 
+diff --git a/lib/smb2-cmd-ioctl.c b/lib/smb2-cmd-ioctl.c
+index 584e1f1..f00f334 100644
+--- a/lib/smb2-cmd-ioctl.c
++++ b/lib/smb2-cmd-ioctl.c
+@@ -72,6 +72,9 @@ smb2_encode_ioctl_request(struct smb2_context *smb2,
+         }
+ 
+         iov = smb2_add_iovector(smb2, &pdu->out, buf, len, free);
++        if (iov == NULL) {
++                return -1;
++        }
+ 
+         smb2_set_uint16(iov, 0, SMB2_IOCTL_REQUEST_SIZE);
+         smb2_set_uint32(iov, 4, req->ctl_code);
+@@ -86,6 +89,9 @@ smb2_encode_ioctl_request(struct smb2_context *smb2,
+         if (req->input_count) {
+                 iov = smb2_add_iovector(smb2, &pdu->out, req->input,
+                                         req->input_count, NULL);
++                if (iov == NULL) {
++                        return -1;
++                }
+         }
+ 
+         return 0;
+@@ -133,6 +139,9 @@ smb2_encode_ioctl_reply(struct smb2_context *smb2,
+         }
+ 
+         iov = smb2_add_iovector(smb2, &pdu->out, buf, len, free);
++        if (iov == NULL) {
++                return -1;
++        }
+ 
+         ioctlv = NULL;
+         if (rep->output_count) {
+@@ -161,6 +170,9 @@ smb2_encode_ioctl_reply(struct smb2_context *smb2,
+                 }
+                 memset(buf, 0, rep->output_count);
+                 ioctlv = smb2_add_iovector(smb2, &pdu->out, buf, len, free);
++                if (ioctlv == NULL) {
++                        return -1;
++                }
+ 
+                 switch (rep->ctl_code) {
+                 case SMB2_FSCTL_VALIDATE_NEGOTIATE_INFO:
+diff --git a/lib/smb2-cmd-lock.c b/lib/smb2-cmd-lock.c
+index 9aab3c5..b7dd06d 100644
+--- a/lib/smb2-cmd-lock.c
++++ b/lib/smb2-cmd-lock.c
+@@ -76,6 +76,10 @@ smb2_encode_lock_request(struct smb2_context *smb2,
+         }
+ 
+         iov = smb2_add_iovector(smb2, &pdu->out, buf, len, free);
++        if (iov == NULL) {
++                smb2_set_error(smb2, "Failed to add iovector for lock request");
++                return -1;
++        }
+ 
+         smb2_set_uint16(iov, 0, SMB2_LOCK_REQUEST_SIZE);
+         smb2_set_uint16(iov, 2, req->lock_count);
+@@ -100,6 +104,10 @@ smb2_encode_lock_request(struct smb2_context *smb2,
+                         return -1;
+                 }
+                 iov = smb2_add_iovector(smb2, &pdu->out, buf, len, free);
++                if (iov == NULL) {
++                        smb2_set_error(smb2, "Failed to add iovector for lock elements");
++                        return -1;
++                }
+ 
+                 for (i = 0, offset = 0; i < req->lock_count - 1; i++) {
+                         smb2_set_uint64(iov, offset, elements->offset);
+@@ -154,6 +162,10 @@ smb2_encode_lock_reply(struct smb2_context *smb2,
+         }
+ 
+         iov = smb2_add_iovector(smb2, &pdu->out, buf, len, free);
++        if (iov == NULL) {
++                smb2_set_error(smb2, "Failed to add iovector for lock reply");
++                return -1;
++        }
+ 
+         smb2_set_uint16(iov, 0, SMB2_LOCK_REPLY_SIZE);
+         return 0;
+diff --git a/lib/smb2-cmd-logoff.c b/lib/smb2-cmd-logoff.c
+index 2ddc269..eb78db0 100644
+--- a/lib/smb2-cmd-logoff.c
++++ b/lib/smb2-cmd-logoff.c
+@@ -70,6 +70,10 @@ smb2_encode_logoff_request(struct smb2_context *smb2,
+         }
+ 
+         iov = smb2_add_iovector(smb2, &pdu->out, buf, len, free);
++        if (iov == NULL) {
++                smb2_set_error(smb2, "Failed to add iovector for logoff request");
++                return -1;
++        }
+ 
+         smb2_set_uint16(iov, 0, SMB2_LOGOFF_REQUEST_SIZE);
+ 
+@@ -117,6 +121,10 @@ smb2_encode_logoff_reply(struct smb2_context *smb2,
+         }
+ 
+         iov = smb2_add_iovector(smb2, &pdu->out, buf, len, free);
++        if (iov == NULL) {
++                smb2_set_error(smb2, "Failed to add iovector for logoff reply");
++                return -1;
++        }
+ 
+         smb2_set_uint16(iov, 0, SMB2_LOGOFF_REPLY_SIZE);
+ 
+diff --git a/lib/smb2-cmd-negotiate.c b/lib/smb2-cmd-negotiate.c
+index cbd99b0..c4c6577 100644
+--- a/lib/smb2-cmd-negotiate.c
++++ b/lib/smb2-cmd-negotiate.c
+@@ -75,6 +75,9 @@ smb2_encode_preauth_context(struct smb2_context *smb2, struct smb2_pdu *pdu)
+         memset(buf, 0, len);
+ 
+         iov = smb2_add_iovector(smb2, &pdu->out, buf, len, free);
++        if (iov == NULL) {
++                return -1;
++        }
+         smb2_set_uint16(iov, 0, SMB2_PREAUTH_INTEGRITY_CAP);
+         smb2_set_uint16(iov, 2, data_len);
+         smb2_set_uint16(iov, 8, 1);
+@@ -105,6 +108,9 @@ smb2_encode_encryption_context(struct smb2_context *smb2, struct smb2_pdu *pdu)
+         memset(buf, 0, len);
+ 
+         iov = smb2_add_iovector(smb2, &pdu->out, buf, len, free);
++        if (iov == NULL) {
++                return -1;
++        }
+         smb2_set_uint16(iov, 0, SMB2_ENCRYPTION_CAP);
+         smb2_set_uint16(iov, 2, data_len);
+         smb2_set_uint16(iov, 8, 1);
+@@ -140,6 +146,10 @@ smb2_encode_negotiate_request(struct smb2_context *smb2,
+         }
+ 
+         iov = smb2_add_iovector(smb2, &pdu->out, buf, len, free);
++        if (iov == NULL) {
++                smb2_set_error(smb2, "Failed to add iovector for negotiate request");
++                return -1;
++        }
+ 
+         if (smb2->version == SMB2_VERSION_ANY ||
+             smb2->version == SMB2_VERSION_ANY3 ||
+@@ -223,6 +233,10 @@ smb2_encode_negotiate_reply(struct smb2_context *smb2,
+         }
+ 
+         iov = smb2_add_iovector(smb2, &pdu->out, buf, len, free);
++        if (iov == NULL) {
++                smb2_set_error(smb2, "Failed to add iovector for negotiate reply");
++                return -1;
++        }
+ 
+         if (rep->security_buffer_length) {
+                 seclen = rep->security_buffer_length;
+@@ -235,10 +249,12 @@ smb2_encode_negotiate_reply(struct smb2_context *smb2,
+                 }
+                 memcpy(buf, rep->security_buffer, rep->security_buffer_length);
+                 memset(buf + rep->security_buffer_length, 0, seclen - rep->security_buffer_length);
+-                smb2_add_iovector(smb2, &pdu->out,
++                if (smb2_add_iovector(smb2, &pdu->out,
+                                         buf,
+-                                        len,
+-                                        free);
++                                        seclen,
++                                        free) == NULL) {
++                        return -1;
++                }
+         }
+ 
+         if (smb2->dialect == SMB2_VERSION_ANY ||
+diff --git a/lib/smb2-cmd-notify-change.c b/lib/smb2-cmd-notify-change.c
+index 875d933..852d034 100644
+--- a/lib/smb2-cmd-notify-change.c
++++ b/lib/smb2-cmd-notify-change.c
+@@ -73,6 +73,10 @@ smb2_encode_change_notify_request(struct smb2_context *smb2,
+         }
+ 
+         iov = smb2_add_iovector(smb2, &pdu->out, buf, len, free);
++        if (iov == NULL) {
++                smb2_set_error(smb2, "Failed to add iovector for change-notify request");
++                return -1;
++        }
+ 
+         smb2_set_uint16(iov, 0, SMB2_CHANGE_NOTIFY_REQUEST_SIZE);
+         smb2_set_uint16(iov, 2, req->flags);
+@@ -125,6 +129,10 @@ smb2_encode_change_notify_reply(struct smb2_context *smb2,
+         }
+ 
+         iov = smb2_add_iovector(smb2, &pdu->out, buf, len, free);
++        if (iov == NULL) {
++                smb2_set_error(smb2, "Failed to add iovector for change-notify reply");
++                return -1;
++        }
+ 
+         smb2_set_uint16(iov, 0, SMB2_CHANGE_NOTIFY_REPLY_SIZE);
+         rep->output_buffer_offset = SMB2_HEADER_SIZE + SMB2_CHANGE_NOTIFY_REQUEST_SIZE;
+@@ -147,6 +155,10 @@ smb2_encode_change_notify_reply(struct smb2_context *smb2,
+                                         buf,
+                                         len,
+                                         free);
++        if (iov == NULL) {
++                smb2_set_error(smb2, "Failed to add iovector for change-notify output buffer");
++                return -1;
++        }
+ 
+         if (smb2->passthrough) {
+                 memcpy(buf, rep->output, rep->output_buffer_length);
+diff --git a/lib/smb2-cmd-oplock-break.c b/lib/smb2-cmd-oplock-break.c
+index 1c22e39..ab9aae5 100644
+--- a/lib/smb2-cmd-oplock-break.c
++++ b/lib/smb2-cmd-oplock-break.c
+@@ -70,6 +70,10 @@ smb2_encode_oplock_break_acknowledgement(struct smb2_context *smb2,
+         }
+ 
+         iov = smb2_add_iovector(smb2, &pdu->out, buf, len, free);
++        if (iov == NULL) {
++                smb2_set_error(smb2, "Failed to add iovector for oplock break ack");
++                return -1;
++        }
+ 
+         smb2_set_uint16(iov, 0, SMB2_OPLOCK_BREAK_ACKNOWLEDGE_SIZE);
+         smb2_set_uint8(iov, 2, req->oplock_level);
+@@ -121,6 +125,10 @@ smb2_encode_oplock_break_reply(struct smb2_context *smb2,
+         }
+ 
+         iov = smb2_add_iovector(smb2, &pdu->out, buf, len, free);
++        if (iov == NULL) {
++                smb2_set_error(smb2, "Failed to add iovector for oplock break reply");
++                return -1;
++        }
+ 
+         smb2_set_uint16(iov, 0, SMB2_OPLOCK_BREAK_REPLY_SIZE);
+         smb2_set_uint8(iov, 2, rep->oplock_level);
+@@ -172,6 +180,10 @@ smb2_encode_oplock_break_notification(struct smb2_context *smb2,
+         }
+ 
+         iov = smb2_add_iovector(smb2, &pdu->out, buf, len, free);
++        if (iov == NULL) {
++                smb2_set_error(smb2, "Failed to add iovector for oplock break notification");
++                return -1;
++        }
+ 
+         smb2_set_uint16(iov, 0, SMB2_OPLOCK_BREAK_REPLY_SIZE);
+         smb2_set_uint8(iov, 2, rep->oplock_level);
+@@ -222,6 +234,10 @@ smb2_encode_lease_break_acknowledgement(struct smb2_context *smb2,
+         }
+ 
+         iov = smb2_add_iovector(smb2, &pdu->out, buf, len, free);
++        if (iov == NULL) {
++                smb2_set_error(smb2, "Failed to add iovector for lease break ack");
++                return -1;
++        }
+ 
+         smb2_set_uint16(iov, 0, SMB2_LEASE_BREAK_ACKNOWLEDGE_SIZE);
+         smb2_set_uint32(iov, 4, req->flags);
+@@ -275,6 +291,10 @@ smb2_encode_lease_break_reply(struct smb2_context *smb2,
+         }
+ 
+         iov = smb2_add_iovector(smb2, &pdu->out, buf, len, free);
++        if (iov == NULL) {
++                smb2_set_error(smb2, "Failed to add iovector for lease break reply");
++                return -1;
++        }
+ 
+         smb2_set_uint16(iov, 0, SMB2_LEASE_BREAK_REPLY_SIZE);
+         smb2_set_uint32(iov, 4, rep->flags);
+@@ -327,6 +347,10 @@ smb2_encode_lease_break_notification(struct smb2_context *smb2,
+         }
+ 
+         iov = smb2_add_iovector(smb2, &pdu->out, buf, len, free);
++        if (iov == NULL) {
++                smb2_set_error(smb2, "Failed to add iovector for lease break notification");
++                return -1;
++        }
+ 
+         smb2_set_uint16(iov, 0, SMB2_LEASE_BREAK_NOTIFICATION_SIZE);
+         smb2_set_uint16(iov, 2, req->new_epoch);
+diff --git a/lib/smb2-cmd-query-directory.c b/lib/smb2-cmd-query-directory.c
+index 31b5002..4733c43 100644
+--- a/lib/smb2-cmd-query-directory.c
++++ b/lib/smb2-cmd-query-directory.c
+@@ -117,6 +117,11 @@ smb2_encode_query_directory_request(struct smb2_context *smb2,
+         }
+ 
+         iov = smb2_add_iovector(smb2, &pdu->out, buf, len, free);
++        if (iov == NULL) {
++                smb2_set_error(smb2, "Failed to add iovector for query-directory request");
++                free(name);
++                return -1;
++        }
+ 
+         /* Name */
+         if (req->name && req->name[0]) {
+@@ -149,6 +154,10 @@ smb2_encode_query_directory_request(struct smb2_context *smb2,
+                                         buf,
+                                         2 * name->len,
+                                         free);
++                if (iov == NULL) {
++                        smb2_set_error(smb2, "Failed to add iovector for query-directory name");
++                        return -1;
++                }
+         }
+         free(name);
+ 
+@@ -277,6 +286,10 @@ smb2_encode_query_directory_reply(struct smb2_context *smb2,
+                                         buf,
+                                         len,
+                                         free);
++        if (iov == NULL) {
++                smb2_set_error(smb2, "Failed to add iovector for query-directory output buffer");
++                return -1;
++        }
+ 
+         in_offset = 0;
+         in_remain = fslen;
+diff --git a/lib/smb2-cmd-query-info.c b/lib/smb2-cmd-query-info.c
+index 3ce3bd6..9b99236 100644
+--- a/lib/smb2-cmd-query-info.c
++++ b/lib/smb2-cmd-query-info.c
+@@ -77,6 +77,10 @@ smb2_encode_query_info_request(struct smb2_context *smb2,
+         }
+ 
+         iov = smb2_add_iovector(smb2, &pdu->out, buf, len, free);
++        if (iov == NULL) {
++                smb2_set_error(smb2, "Failed to add iovector for query-info request");
++                return -1;
++        }
+ 
+         smb2_set_uint16(iov, 0, SMB2_QUERY_INFO_REQUEST_SIZE);
+         smb2_set_uint8(iov, 2, req->info_type);
+@@ -145,6 +149,10 @@ smb2_encode_query_info_reply(struct smb2_context *smb2,
+         }
+ 
+         cmdiov = smb2_add_iovector(smb2, &pdu->out, buf, len, free);
++        if (cmdiov == NULL) {
++                smb2_set_error(smb2, "Failed to add iovector for query-info reply header");
++                return -1;
++        }
+ 
+         smb2_set_uint16(cmdiov, 0, SMB2_QUERY_INFO_REPLY_SIZE);
+         smb2_set_uint16(cmdiov, 2, rep->output_buffer_offset);
+@@ -164,6 +172,10 @@ smb2_encode_query_info_reply(struct smb2_context *smb2,
+                                         buf,
+                                         len + 1024,
+                                         free);
++                if (iov == NULL) {
++                        smb2_set_error(smb2, "Failed to add iovector for query-info output buffer");
++                        return -1;
++                }
+ 
+                 created_output_buffer_length = 0;
+ 
+diff --git a/lib/smb2-cmd-read.c b/lib/smb2-cmd-read.c
+index 4420c65..720d345 100644
+--- a/lib/smb2-cmd-read.c
++++ b/lib/smb2-cmd-read.c
+@@ -72,6 +72,9 @@ smb2_encode_read_request(struct smb2_context *smb2,
+         }
+ 
+         iov = smb2_add_iovector(smb2, &pdu->out, buf, len, free);
++        if (iov == NULL) {
++                return -1;
++        }
+ 
+         if (!smb2->supports_multi_credit && req->length > 64 * 1024) {
+                 req->length = 64 * 1024;
+@@ -107,6 +110,9 @@ smb2_encode_read_request(struct smb2_context *smb2,
+                                                         buf,
+                                                         len,
+                                                         free);
++                        if (iov == NULL) {
++                                return -1;
++                        }
+                 }
+                 else {
+                         smb2_set_error(smb2, "ChannelInfo not yet implemented");
+@@ -120,7 +126,9 @@ smb2_encode_read_request(struct smb2_context *smb2,
+         if (req->read_channel_info_length == 0) {
+                 static uint8_t zero;
+ 
+-                smb2_add_iovector(smb2, &pdu->out, &zero, 1, NULL);
++                if (smb2_add_iovector(smb2, &pdu->out, &zero, 1, NULL) == NULL) {
++                        return -1;
++                }
+         }
+ 
+         return 0;
+@@ -152,7 +160,10 @@ smb2_cmd_read_async(struct smb2_context *smb2,
+                         return NULL;
+                 }
+ 
+-                smb2_add_iovector(smb2, &pdu->in, req->buf, req->length, NULL);
++                if (smb2_add_iovector(smb2, &pdu->in, req->buf, req->length, NULL) == NULL) {
++                        smb2_free_pdu(smb2, pdu);
++                        return NULL;
++                }
+         }
+ 
+         if (smb2_pad_to_64bit(smb2, &pdu->out) != 0) {
+@@ -185,6 +196,9 @@ smb2_encode_read_reply(struct smb2_context *smb2,
+         }
+ 
+         iov = smb2_add_iovector(smb2, &pdu->out, buf, len, free);
++        if (iov == NULL) {
++                return -1;
++        }
+ 
+         rep->data_offset = 0;
+         if (rep->data_length && rep->data) {
+@@ -196,7 +210,9 @@ smb2_encode_read_reply(struct smb2_context *smb2,
+         smb2_set_uint32(iov, 8, rep->data_remaining);
+ 
+         if (rep->data_length > 0 && rep->data) {
+-                smb2_add_iovector(smb2, &pdu->out, rep->data, rep->data_length, free);
++                if (smb2_add_iovector(smb2, &pdu->out, rep->data, rep->data_length, free) == NULL) {
++                        return -1;
++                }
+         }
+ 
+         return 0;
+diff --git a/lib/smb2-cmd-session-setup.c b/lib/smb2-cmd-session-setup.c
+index f58edf5..9244283 100644
+--- a/lib/smb2-cmd-session-setup.c
++++ b/lib/smb2-cmd-session-setup.c
+@@ -73,6 +73,10 @@ smb2_encode_session_setup_request(struct smb2_context *smb2,
+         }
+ 
+         iov = smb2_add_iovector(smb2, &pdu->out, buf, len, free);
++        if (iov == NULL) {
++                smb2_set_error(smb2, "Failed to add iovector for session setup request");
++                return -1;
++        }
+ 
+         smb2_set_uint16(iov, 0, SMB2_SESSION_SETUP_REQUEST_SIZE);
+         smb2_set_uint8(iov, 2, req->flags);
+@@ -95,6 +99,10 @@ smb2_encode_session_setup_request(struct smb2_context *smb2,
+                                 buf,
+                                 req->security_buffer_length,
+                                 free);
++        if (iov == NULL) {
++                smb2_set_error(smb2, "Failed to add iovector for session setup security buffer");
++                return -1;
++        }
+         return 0;
+ }
+ 
+@@ -142,6 +150,10 @@ smb2_encode_session_setup_reply(struct smb2_context *smb2,
+         }
+ 
+         iov = smb2_add_iovector(smb2, &pdu->out, buf, len, free);
++        if (iov == NULL) {
++                smb2_set_error(smb2, "Failed to add iovector for session setup reply");
++                return -1;
++        }
+ 
+         smb2_set_uint16(iov, 0, SMB2_SESSION_SETUP_REPLY_SIZE);
+         smb2_set_uint16(iov, 2, rep->session_flags);
+@@ -164,6 +176,10 @@ smb2_encode_session_setup_reply(struct smb2_context *smb2,
+                                         buf,
+                                         len,
+                                         free);
++                if (iov == NULL) {
++                        smb2_set_error(smb2, "Failed to add iovector for session setup reply buffer");
++                        return -1;
++                }
+         }
+         /* TODO append neg contexts? */
+         return 0;
+diff --git a/lib/smb2-cmd-set-info.c b/lib/smb2-cmd-set-info.c
+index 3a32e4a..d5f89eb 100644
+--- a/lib/smb2-cmd-set-info.c
++++ b/lib/smb2-cmd-set-info.c
+@@ -77,6 +77,10 @@ smb2_encode_set_info_request(struct smb2_context *smb2,
+         }
+ 
+         iov = smb2_add_iovector(smb2, &pdu->out, buf, len, free);
++        if (iov == NULL) {
++                smb2_set_error(smb2, "Failed to add iovector for set-info request header");
++                return -1;
++        }
+ 
+         smb2_set_uint16(iov, 0, SMB2_SET_INFO_REQUEST_SIZE);
+         smb2_set_uint8(iov, 2, req->info_type);
+@@ -94,7 +98,11 @@ smb2_encode_set_info_request(struct smb2_context *smb2,
+                                 return -1;
+                         }
+                         memcpy(buf, req->input_data, req->buffer_length);
+-                        smb2_add_iovector(smb2, &pdu->out, buf, req->buffer_length, free);
++                        iov = smb2_add_iovector(smb2, &pdu->out, buf, req->buffer_length, free);
++                        if (iov == NULL) {
++                                smb2_set_error(smb2, "Failed to add iovector for set-info passthrough buffer");
++                                return -1;
++                        }
+                 }
+                 smb2_set_uint32(iov, 4, req->buffer_length);
+                 smb2_set_uint16(iov, 8, req->buffer_offset);
+@@ -116,6 +124,10 @@ smb2_encode_set_info_request(struct smb2_context *smb2,
+                         }
+                         iov = smb2_add_iovector(smb2, &pdu->out, buf, len,
+                                                 free);
++                        if (iov == NULL) {
++                                smb2_set_error(smb2, "Failed to add iovector for set-info basic data");
++                                return -1;
++                        }
+                         smb2_encode_file_basic_info(smb2, req->input_data, iov);
+                         break;
+                 case SMB2_FILE_END_OF_FILE_INFORMATION:
+@@ -130,6 +142,10 @@ smb2_encode_set_info_request(struct smb2_context *smb2,
+                         }
+                         iov = smb2_add_iovector(smb2, &pdu->out, buf, len,
+                                                 free);
++                        if (iov == NULL) {
++                                smb2_set_error(smb2, "Failed to add iovector for set-info EOF data");
++                                return -1;
++                        }
+ 
+                         eofi = req->input_data;
+                         smb2_set_uint64(iov, 0, eofi->end_of_file);
+@@ -162,6 +178,11 @@ smb2_encode_set_info_request(struct smb2_context *smb2,
+                         }
+                         iov = smb2_add_iovector(smb2, &pdu->out, buf, len,
+                                                 free);
++                        if (iov == NULL) {
++                                smb2_set_error(smb2, "Failed to add iovector for set-info rename data");
++                                free(name);
++                                return -1;
++                        }
+ 
+                         smb2_set_uint8(iov, 0, rni->replace_if_exist);
+                         smb2_set_uint64(iov, 8, 0u);
+@@ -182,6 +203,10 @@ smb2_encode_set_info_request(struct smb2_context *smb2,
+                         }
+                         iov = smb2_add_iovector(smb2, &pdu->out, buf, len,
+                                                 free);
++                        if (iov == NULL) {
++                                smb2_set_error(smb2, "Failed to add iovector for set-info disposition data");
++                                return -1;
++                        }
+ 
+                         fdi = req->input_data;
+                         smb2_set_uint8(iov, 0, fdi->delete_pending);
+@@ -246,6 +271,10 @@ smb2_encode_set_info_reply(struct smb2_context *smb2,
+         }
+ 
+         iov = smb2_add_iovector(smb2, &pdu->out, buf, len, free);
++        if (iov == NULL) {
++                smb2_set_error(smb2, "Failed to add iovector for set-info reply header");
++                return -1;
++        }
+         smb2_set_uint16(iov, 0, SMB2_SET_INFO_REPLY_SIZE);
+         return 0;
+ }
+diff --git a/lib/smb2-cmd-tree-connect.c b/lib/smb2-cmd-tree-connect.c
+index a4846a7..9eb3099 100644
+--- a/lib/smb2-cmd-tree-connect.c
++++ b/lib/smb2-cmd-tree-connect.c
+@@ -73,6 +73,10 @@ smb2_encode_tree_connect_request(struct smb2_context *smb2,
+         }
+ 
+         iov = smb2_add_iovector(smb2, &pdu->out, buf, len, free);
++        if (iov == NULL) {
++                smb2_set_error(smb2, "Failed to add iovector for tree connect request");
++                return -1;
++        }
+ 
+         smb2_set_uint16(iov, 0, SMB2_TREE_CONNECT_REQUEST_SIZE);
+         smb2_set_uint16(iov, 2, req->flags);
+@@ -92,6 +96,10 @@ smb2_encode_tree_connect_request(struct smb2_context *smb2,
+                                 buf,
+                                 req->path_length,
+                                 free);
++        if (iov == NULL) {
++                smb2_set_error(smb2, "Failed to add iovector for tree connect path");
++                return -1;
++        }
+ 
+         return 0;
+ }
+@@ -139,6 +147,10 @@ smb2_encode_tree_connect_reply(struct smb2_context *smb2,
+         }
+ 
+         iov = smb2_add_iovector(smb2, &pdu->out, buf, len, free);
++        if (iov == NULL) {
++                smb2_set_error(smb2, "Failed to add iovector for tree connect reply");
++                return -1;
++        }
+ 
+         smb2_set_uint16(iov, 0, SMB2_TREE_CONNECT_REPLY_SIZE);
+         smb2_set_uint8(iov, 2, rep->share_type);
+diff --git a/lib/smb2-cmd-tree-disconnect.c b/lib/smb2-cmd-tree-disconnect.c
+index 8541742..4e74abe 100644
+--- a/lib/smb2-cmd-tree-disconnect.c
++++ b/lib/smb2-cmd-tree-disconnect.c
+@@ -71,6 +71,10 @@ smb2_encode_tree_disconnect_request(struct smb2_context *smb2,
+         }
+ 
+         iov = smb2_add_iovector(smb2, &pdu->out, buf, len, free);
++        if (iov == NULL) {
++                smb2_set_error(smb2, "Failed to add iovector for tree disconnect request");
++                return -1;
++        }
+ 
+         smb2_set_uint16(iov, 0, SMB2_TREE_DISCONNECT_REQUEST_SIZE);
+ 
+@@ -118,6 +122,10 @@ smb2_encode_tree_disconnect_reply(struct smb2_context *smb2,
+         }
+ 
+         iov = smb2_add_iovector(smb2, &pdu->out, buf, len, free);
++        if (iov == NULL) {
++                smb2_set_error(smb2, "Failed to add iovector for tree disconnect reply");
++                return -1;
++        }
+ 
+         smb2_set_uint16(iov, 0, SMB2_TREE_DISCONNECT_REPLY_SIZE);
+ 
+diff --git a/lib/smb2-cmd-write.c b/lib/smb2-cmd-write.c
+index 2c5decf..08ed7c6 100644
+--- a/lib/smb2-cmd-write.c
++++ b/lib/smb2-cmd-write.c
+@@ -72,6 +72,9 @@ smb2_encode_write_request(struct smb2_context *smb2,
+         }
+ 
+         iov = smb2_add_iovector(smb2, &pdu->out, buf, len, free);
++        if (iov == NULL) {
++                return -1;
++        }
+ 
+         if (!smb2->supports_multi_credit && req->length > 64 * 1024) {
+                 req->length = 64 * 1024;
+@@ -106,6 +109,9 @@ smb2_encode_write_request(struct smb2_context *smb2,
+                                                         buf,
+                                                         len,
+                                                         free);
++                        if (iov == NULL) {
++                                return -1;
++                        }
+                 }
+                 else {
+                         smb2_set_error(smb2, "ChannelInfo not yet implemented");
+@@ -139,8 +145,11 @@ smb2_cmd_write_async(struct smb2_context *smb2,
+                 return NULL;
+         }
+ 
+-        smb2_add_iovector(smb2, &pdu->out, (uint8_t*)req->buf,
+-                        req->length, pass_buf_ownership ? free : NULL);
++        if (smb2_add_iovector(smb2, &pdu->out, (uint8_t*)req->buf,
++                        req->length, pass_buf_ownership ? free : NULL) == NULL) {
++                smb2_free_pdu(smb2, pdu);
++                return NULL;
++        }
+ 
+         /* Adjust credit charge for large payloads */
+         if (smb2->supports_multi_credit) {
+@@ -167,6 +176,9 @@ smb2_encode_write_reply(struct smb2_context *smb2,
+         }
+ 
+         iov = smb2_add_iovector(smb2, &pdu->out, buf, len, free);
++        if (iov == NULL) {
++                return -1;
++        }
+ 
+         smb2_set_uint16(iov, 0, SMB2_WRITE_REPLY_SIZE);
+         smb2_set_uint32(iov, 4, rep->count);
+diff --git a/lib/smb3-seal.c b/lib/smb3-seal.c
+index 056df0b..b894f5f 100644
+--- a/lib/smb3-seal.c
++++ b/lib/smb3-seal.c
+@@ -148,8 +148,13 @@ smb3_decrypt_pdu(struct smb2_context *smb2)
+ 
+                 smb2->spl = (uint32_t)smb2->enc_len;
+                 smb2->recv_state = SMB2_RECV_HEADER;
+-                smb2_add_iovector(smb2, &smb2->in, &smb2->header[0],
+-                                  SMB2_HEADER_SIZE, NULL);
++                if (smb2_add_iovector(smb2, &smb2->in, &smb2->header[0],
++                                       SMB2_HEADER_SIZE, NULL) == NULL) {
++                        smb2_set_error(smb2, "Failed to add iovector for decrypted header");
++                        free(smb2->enc);
++                        smb2->enc = NULL;
++                        return -1;
++                }
+         }
+ 
+         rc = smb2_read_from_buf(smb2);
+diff --git a/lib/socket.c b/lib/socket.c
+index c49a136..0241cf0 100644
+--- a/lib/socket.c
++++ b/lib/socket.c
+@@ -401,17 +401,28 @@ read_more_data:
+         case SMB2_RECV_SPL:
+                 smb2->spl = be32toh(smb2->spl);
+                 smb2->recv_state = SMB2_RECV_HEADER;
+-                smb2_add_iovector(smb2, &smb2->in, &smb2->header[0],
+-                                  SMB2_HEADER_SIZE, NULL);
++                if (smb2_add_iovector(smb2, &smb2->in, &smb2->header[0],
++                                  SMB2_HEADER_SIZE, NULL) == NULL) {
++                        smb2_set_error(smb2, "Too many I/O vectors when adding header");
++                        return -1;
++                }
+                 goto read_more_data;
+         case SMB2_RECV_HEADER:
+                 if (!memcmp(smb2->in.iov[smb2->in.niov - 1].buf, smb3tfrm, 4)) {
+                         smb2->in.iov[smb2->in.niov - 1].len = 52;
+                         len = smb2->spl - 52;
+                         smb2->in.total_size -= 12;
+-                        smb2_add_iovector(smb2, &smb2->in,
+-                                          malloc(len),
+-                                          len, free);
++                        {
++                                uint8_t *tmp = malloc(len);
++                                if (tmp == NULL) {
++                                        smb2_set_error(smb2, "malloc failed while adding TRFM payload");
++                                        return -1;
++                                }
++                                if (smb2_add_iovector(smb2, &smb2->in,tmp,len, free) == NULL) {
++                                        smb2_set_error(smb2, "Failed to add iovector for TRFM payload");
++                                        return -1;
++                                }
++                        }
+                         memcpy(smb2->in.iov[smb2->in.niov - 1].buf,
+                                &smb2->in.iov[smb2->in.niov - 2].buf[52], 12);
+                         smb2->recv_state = SMB2_RECV_TRFM;
+@@ -490,9 +501,16 @@ read_more_data:
+                         }
+                         /* Add padding before the next PDU */
+                         smb2->recv_state = SMB2_RECV_PAD;
+-                        smb2_add_iovector(smb2, &smb2->in,
+-                                          malloc(len),
+-                                          len, free);
++                        {
++                                uint8_t *tmp = malloc(len);
++                                if (tmp == NULL) {
++                                        smb2_set_error(smb2, "malloc failed while adding PENDING padding");
++                                        return -1;
++                                }
++                                if (smb2_add_iovector(smb2, &smb2->in,tmp, len, free) == NULL) {
++                                        return -1;
++                                }
++                        }
+                         goto read_more_data;
+                 }
+ 
+@@ -555,9 +573,19 @@ read_more_data:
+                 }
+ 
+                 smb2->recv_state = SMB2_RECV_FIXED;
+-                smb2_add_iovector(smb2, &smb2->in,
+-                                  malloc(len & 0xfffe),
+-                                  len & 0xfffe, free);
++                {
++                        size_t alen = len & 0xfffe;
++                        uint8_t *tmp = malloc(alen);
++                        if (tmp == NULL) {
++                                smb2_set_error(smb2, "malloc failed while adding FIXED payload");
++                                return -1;
++                        }
++                        if (smb2_add_iovector(smb2, &smb2->in,
++                                  tmp,
++                                  alen, free) == NULL) {
++                                return -1;
++                        }
++                }
+                 goto read_more_data;
+         case SMB2_RECV_FIXED:
+                 len = smb2_process_payload_fixed(smb2, pdu);
+@@ -576,9 +604,11 @@ read_more_data:
+                                 if (num > (size_t)len) {
+                                         num = (size_t)len;
+                                 }
+-                                smb2_add_iovector(smb2, &smb2->in,
++                                if (smb2_add_iovector(smb2, &smb2->in,
+                                                   pdu->in.iov[i].buf,
+-                                                  num, NULL);
++                                                  num, NULL) == NULL) {
++                                        return -1;
++                                }
+                                 len -= num;
+ 
+                                 if (len == 0) {
+@@ -588,9 +618,18 @@ read_more_data:
+                         }
+                         if (len > 0) {
+                                 smb2->recv_state = SMB2_RECV_VARIABLE;
+-                                smb2_add_iovector(smb2, &smb2->in,
+-                                                  malloc(len),
+-                                                  len, free);
++                                {
++                                        uint8_t *tmp = malloc(len);
++                                        if (tmp == NULL) {
++                                                smb2_set_error(smb2, "malloc failed while adding VARIABLE tail");
++                                                return -1;
++                                        }
++                                        if (smb2_add_iovector(smb2, &smb2->in,
++                                                  tmp,
++                                                  len, free) == NULL) {
++                                                return -1;
++                                        }
++                                }
+                                 goto read_more_data;
+                         }
+                 }
+@@ -618,9 +657,18 @@ read_more_data:
+                 if (len > 0) {
+                         /* Add padding before the next PDU */
+                         smb2->recv_state = SMB2_RECV_PAD;
+-                        smb2_add_iovector(smb2, &smb2->in,
+-                                          malloc(len),
+-                                          len, free);
++                        {
++                                uint8_t *tmp = malloc(len);
++                                if (tmp == NULL) {
++                                        smb2_set_error(smb2, "malloc failed while adding PAD");
++                                        return -1;
++                                }
++                                if (smb2_add_iovector(smb2, &smb2->in,
++                                          tmp,
++                                          len, free) == NULL) {
++                                        return -1;
++                                }
++                        }
+                         goto read_more_data;
+                 }
+ 
+@@ -658,9 +706,17 @@ read_more_data:
+                 if (len > 0) {
+                         /* Add padding before the next PDU */
+                         smb2->recv_state = SMB2_RECV_PAD;
+-                        smb2_add_iovector(smb2, &smb2->in,
+-                                          malloc(len),
+-                                          len, free);
++                        uint8_t * tmp = malloc(len);
++                        if (tmp == NULL) {
++                            smb2_set_error(smb2, "malloc failed while adding PAD");
++                            return -1;
++                        }
++                        if (smb2_add_iovector(smb2, &smb2->in,
++                                              tmp,
++                                              len, free) == NULL) {
++                                smb2_set_error(smb2, "Failed to add iovector for PAD");
++                                return -1;
++                        }
+                         goto read_more_data;
+                 }
+ 
+@@ -757,8 +813,11 @@ read_more_data:
+                 /* Record at which iov we ended in this loop so we know where to start in the next */
+                 iov_offset = smb2->in.niov - 1;
+                 smb2->recv_state = SMB2_RECV_HEADER;
+-                smb2_add_iovector(smb2, &smb2->in, &smb2->header[0],
+-                                  SMB2_HEADER_SIZE, NULL);
++                if (smb2_add_iovector(smb2, &smb2->in, &smb2->header[0],
++                                  SMB2_HEADER_SIZE, NULL) == NULL) {
++                        smb2_set_error(smb2, "Too many I/O vectors when adding chained header");
++                        return -1;
++                }
+                 goto read_more_data;
+         }
+ 
+@@ -793,8 +852,11 @@ smb2_read_from_socket(struct smb2_context *smb2)
+                         smb2->spl = 0;
+ 
+                         smb2_free_iovector(smb2, &smb2->in);
+-                        smb2_add_iovector(smb2, &smb2->in, (uint8_t *)&smb2->spl,
+-                                          SMB2_SPL_SIZE, NULL);
++                        if (smb2_add_iovector(smb2, &smb2->in, (uint8_t *)&smb2->spl,
++                                          SMB2_SPL_SIZE, NULL) == NULL) {
++                                smb2_set_error(smb2, "Too many I/O vectors when adding SPL");
++                                return -1;
++                        }
+                 }
+ 
+                 count = smb2_read_data(smb2, smb2_readv_from_socket, 0);
+-- 
+2.56.0
+

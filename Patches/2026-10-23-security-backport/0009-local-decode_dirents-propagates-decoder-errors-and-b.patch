@@ -1,0 +1,95 @@
+From 62be50d7d5586e7528afa132bf92776dd1b336f6 Mon Sep 17 00:00:00 2001
+From: BookBoy local patch <noreply@bookboy.invalid>
+Date: Fri, 23 Oct 2026 01:32:13 +0800
+Subject: [PATCH 9/9] local: decode_dirents propagates decoder errors and
+ bounds next_entry_offset
+
+---
+ lib/libsmb2.c                  | 29 +++++++++++++++++++++++------
+ lib/smb2-cmd-query-directory.c |  8 ++++++++
+ 2 files changed, 31 insertions(+), 6 deletions(-)
+
+diff --git a/lib/libsmb2.c b/lib/libsmb2.c
+index f1e08ed..7bb44ae 100644
+--- a/lib/libsmb2.c
++++ b/lib/libsmb2.c
+@@ -295,6 +295,7 @@ decode_dirents(struct smb2_context *smb2, struct smb2dir *dir,
+         struct smb2_dirent_internal *ent;
+         struct smb2_fileidfulldirectoryinformation fs;
+         uint32_t offset = 0;
++        uint32_t name_len;
+ 
+         do {
+                 struct smb2_iovec tmp_vec _U_;
+@@ -305,20 +306,36 @@ decode_dirents(struct smb2_context *smb2, struct smb2dir *dir,
+                         return -1;
+                 }
+ 
++                tmp_vec.buf = &vec->buf[offset];
++                tmp_vec.len = vec->len - offset;
++
++                memset(&fs, 0, sizeof(fs));
++                if (smb2_decode_fileidfulldirectoryinformation(smb2, &fs,
++                                                               &tmp_vec) < 0) {
++                        return -1;
++                }
++                /* A following entry must start after this one's name and
++                 * within the reply, so offsets only move forward.
++                 */
++                smb2_get_uint32(&tmp_vec, 60, &name_len);
++                if (fs.next_entry_offset &&
++                    (fs.next_entry_offset < 80 + name_len ||
++                     fs.next_entry_offset > tmp_vec.len)) {
++                        free(discard_const(fs.name));
++                        smb2_set_error(smb2, "Malformed next entry offset "
++                                       "in query reply.");
++                        return -1;
++                }
++
+                 ent = calloc(1, sizeof(struct smb2_dirent_internal));
+                 if (ent == NULL) {
++                        free(discard_const(fs.name));
+                         smb2_set_error(smb2, "Failed to allocate "
+                                        "dirent_internal");
+                         return -1;
+                 }
+                 SMB2_LIST_ADD(&dir->entries, ent);
+ 
+-
+-                tmp_vec.buf = &vec->buf[offset];
+-                tmp_vec.len = vec->len - offset;
+-
+-                smb2_decode_fileidfulldirectoryinformation(smb2, &fs,
+-                                                           &tmp_vec);
+                 /* steal the name */
+                 ent->dirent.name = fs.name;
+                 ent->dirent.st.smb2_type = SMB2_TYPE_FILE;
+diff --git a/lib/smb2-cmd-query-directory.c b/lib/smb2-cmd-query-directory.c
+index 24656cc..2a83d7a 100644
+--- a/lib/smb2-cmd-query-directory.c
++++ b/lib/smb2-cmd-query-directory.c
+@@ -67,6 +67,10 @@ smb2_decode_fileidfulldirectoryinformation(
+          * that all other fields also fit within the remainder of the
+          * vector.
+          */
++        if (vec->len < 80) {
++                smb2_set_error(smb2, "Malformed name in query.\n");
++                return -1;
++        }
+         smb2_get_uint32(vec, 60, &name_len);
+         if (name_len > 80 + name_len ||
+             80 + name_len > vec->len) {
+@@ -83,6 +87,10 @@ smb2_decode_fileidfulldirectoryinformation(
+         smb2_get_uint64(vec, 72, &fs->file_id);
+ 
+         fs->name = smb2_utf16_to_utf8((uint16_t *)(void *)&vec->buf[80], name_len / 2);
++        if (fs->name == NULL) {
++                smb2_set_error(smb2, "Failed to allocate name in query.\n");
++                return -1;
++        }
+ 
+         smb2_get_uint64(vec, 8, &t);
+         smb2_win_to_timeval(t, &fs->creation_time);
+-- 
+2.56.0
+

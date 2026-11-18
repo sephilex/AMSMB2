@@ -124,8 +124,8 @@ smb3_encrypt_pdu(struct smb2_context *smb2,
         return 0;
 }
 
-int
-smb3_decrypt_pdu(struct smb2_context *smb2)
+static int
+smb3_do_decrypt_pdu(struct smb2_context *smb2)
 {
         int rc;
 
@@ -146,15 +146,60 @@ smb3_decrypt_pdu(struct smb2_context *smb2)
                 smb2->in.iov[smb2->in.niov - 1].free = NULL;
                 smb2_free_iovector(smb2, &smb2->in);
 
+                /*
+                 * The decrypted blob is fed back through the same receive
+                 * state machine with enc_len standing in for the SPL, so it
+                 * needs the same sanity check the on-the-wire SPL gets.
+                 */
+                if (smb2->enc_len < SMB2_HEADER_SIZE ||
+                    smb2->enc_len > smb2_recv_pdu_cap(smb2)) {
+                        smb2_set_error(smb2, "Invalid decrypted PDU length %zu",
+                                       smb2->enc_len);
+                        free(smb2->enc);
+                        smb2->enc = NULL;
+                        return -1;
+                }
+
                 smb2->spl = (uint32_t)smb2->enc_len;
                 smb2->recv_state = SMB2_RECV_HEADER;
-                smb2_add_iovector(smb2, &smb2->in, &smb2->header[0],
-                                  SMB2_HEADER_SIZE, NULL);
+                if (smb2_add_iovector(smb2, &smb2->in, &smb2->header[0],
+                                       SMB2_HEADER_SIZE, NULL) == NULL) {
+                        smb2_set_error(smb2, "Failed to add iovector for decrypted header");
+                        free(smb2->enc);
+                        smb2->enc = NULL;
+                        return -1;
+                }
         }
 
         rc = smb2_read_from_buf(smb2);
         free(smb2->enc);
         smb2->enc = NULL;
+
+        return rc;
+}
+
+int
+smb3_decrypt_pdu(struct smb2_context *smb2)
+{
+        int rc;
+
+        /*
+         * The decrypted payload is fed back through the same receive state
+         * machine, whose SMB2_RECV_HEADER case tests for the transform
+         * magic and calls us again on a match. SMB3 never nests transform
+         * headers, so a payload that contains one is a peer trying to
+         * recurse us off the end of the stack - and each level also
+         * overwrites smb2->enc, leaking the outer buffer and corrupting the
+         * outer read state. Refuse to go more than one deep.
+         */
+        if (smb2->enc_depth > 0) {
+                smb2_set_error(smb2, "Nested SMB3 transform header");
+                return -1;
+        }
+
+        smb2->enc_depth++;
+        rc = smb3_do_decrypt_pdu(smb2);
+        smb2->enc_depth--;
 
         return rc;
 }

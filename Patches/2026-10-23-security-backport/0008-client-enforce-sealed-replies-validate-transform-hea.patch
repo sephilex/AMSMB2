@@ -1,0 +1,171 @@
+From 4e5f08fff134e67c86eebc2ce070c95fa3433c7f Mon Sep 17 00:00:00 2001
+From: Mehmet Tenekeci <mehmet.tenekeci@imtf.com>
+Date: Sun, 11 Oct 2026 11:10:51 +0200
+Subject: [PATCH 8/9] client: enforce sealed replies, validate transform
+ headers, cap receives (#493)
+
+Once SMB3 encryption keys are derived on a client with sealing in effect,
+refuse any PDU that did not arrive inside a transform, before the header
+is decoded. Validate transform flags, SessionId and OriginalMessageSize
+against the SPL before allocating for the payload.
+
+Cap peer-supplied receive lengths at MAX(max_read_size, max_write_size)
+plus 64 KiB headroom, falling back to SMB2_MAX_PDU_SIZE before NEGOTIATE
+and never exceeding it.
+
+(cherry picked from commit e94eee9465d55ed094ace2c038a8705b4822dada)
+---
+ include/libsmb2-private.h | 18 ++++++++++++++
+ lib/libsmb2.c             |  4 ++++
+ lib/smb3-seal.c           |  2 +-
+ lib/socket.c              | 49 ++++++++++++++++++++++++++++++++++++++-
+ 4 files changed, 71 insertions(+), 2 deletions(-)
+
+diff --git a/include/libsmb2-private.h b/include/libsmb2-private.h
+index bf4342a..e1e7006 100644
+--- a/include/libsmb2-private.h
++++ b/include/libsmb2-private.h
+@@ -181,6 +181,8 @@ struct smb2_context {
+ 
+         uint8_t seal:1;
+         uint8_t sign:1;
++        /* SMB3 encryption keys derived; sealed clients refuse plaintext from here on */
++        uint8_t enc_keys_ready:1;
+         uint8_t signing_key[SMB2_KEY_SIZE];
+         uint8_t serverin_key[SMB2_KEY_SIZE];
+         uint8_t serverout_key[SMB2_KEY_SIZE];
+@@ -289,6 +291,22 @@ typedef void (*smb2_free_payload)(struct smb2_context *smb2, void *payload);
+ 
+ #define SMB2_MAX_PDU_SIZE 16*1024*1024
+ 
++/* headroom over the negotiated read/write size for headers and the transform header */
++#define SMB2_RECV_PDU_SLACK (64 * 1024)
++
++/* cap peer-supplied PDU lengths to the negotiated read/write size, never above SMB2_MAX_PDU_SIZE */
++static inline uint32_t
++smb2_recv_pdu_cap(const struct smb2_context *smb2)
++{
++        uint32_t max = smb2->max_read_size > smb2->max_write_size ?
++                smb2->max_read_size : smb2->max_write_size;
++
++        if (max == 0 || max > SMB2_MAX_PDU_SIZE - SMB2_RECV_PDU_SLACK) {
++                return SMB2_MAX_PDU_SIZE;
++        }
++        return max + SMB2_RECV_PDU_SLACK;
++}
++
+ struct smb2_pdu {
+         struct smb2_pdu *next;
+         struct smb2_header header;
+diff --git a/lib/libsmb2.c b/lib/libsmb2.c
+index 0f8a307..f1e08ed 100644
+--- a/lib/libsmb2.c
++++ b/lib/libsmb2.c
+@@ -186,6 +186,7 @@ smb2_close_context(struct smb2_context *smb2)
+         smb2->message_id = 0;
+         smb2->session_id = 0;
+         smb2->session_flags = 0;
++        smb2->enc_keys_ready = 0;
+         smb2->tree_id_top = 0;
+         smb2->tree_id_cur = 0;
+         smb2->tree_id[0] = 0xdeadbeef;
+@@ -763,6 +764,9 @@ session_setup_cb(struct smb2_context *smb2, int status,
+                 }
+ 
+                 smb2_create_signing_key(smb2);
++                if (smb2->dialect >= SMB2_VERSION_0300) {
++                        smb2->enc_keys_ready = 1;
++                }
+ 
+                 /*
+                  * This is the final leg of session setup, the first message
+diff --git a/lib/smb3-seal.c b/lib/smb3-seal.c
+index 20b2118..70e381b 100644
+--- a/lib/smb3-seal.c
++++ b/lib/smb3-seal.c
+@@ -152,7 +152,7 @@ smb3_do_decrypt_pdu(struct smb2_context *smb2)
+                  * needs the same sanity check the on-the-wire SPL gets.
+                  */
+                 if (smb2->enc_len < SMB2_HEADER_SIZE ||
+-                    smb2->enc_len > SMB2_MAX_PDU_SIZE) {
++                    smb2->enc_len > smb2_recv_pdu_cap(smb2)) {
+                         smb2_set_error(smb2, "Invalid decrypted PDU length %zu",
+                                        smb2->enc_len);
+                         free(smb2->enc);
+diff --git a/lib/socket.c b/lib/socket.c
+index bace197..966d9e4 100644
+--- a/lib/socket.c
++++ b/lib/socket.c
+@@ -421,7 +421,7 @@ read_more_data:
+                  * exhaustion vector, before we act on it.
+                  */
+                 if (smb2->spl < SMB2_HEADER_SIZE ||
+-                    smb2->spl > SMB2_MAX_PDU_SIZE) {
++                    smb2->spl > smb2_recv_pdu_cap(smb2)) {
+                         smb2_set_error(smb2, "Invalid session packet length "
+                                        "%u in PDU", smb2->spl);
+                         return -1;
+@@ -435,6 +435,46 @@ read_more_data:
+                 goto read_more_data;
+         case SMB2_RECV_HEADER:
+                 if (!memcmp(smb2->in.iov[smb2->in.niov - 1].buf, smb3tfrm, 4)) {
++                        if (!smb2_is_server(smb2)) {
++                                /* validate the transform header before allocating for its payload */
++                                const uint8_t *th = smb2->in.iov[smb2->in.niov - 1].buf;
++                                uint32_t orig_size;
++                                uint16_t th_flags;
++                                uint64_t th_session;
++
++                                memcpy(&orig_size, &th[36], 4);
++                                orig_size = le32toh(orig_size);
++                                memcpy(&th_flags, &th[42], 2);
++                                th_flags = le16toh(th_flags);
++                                memcpy(&th_session, &th[44], 8);
++                                th_session = le64toh(th_session);
++                                if (!smb2->enc_keys_ready) {
++                                        smb2_set_error(smb2, "Transform header "
++                                                       "received before the "
++                                                       "encryption keys exist");
++                                        return -1;
++                                }
++                                if (th_flags != 0x0001) {
++                                        smb2_set_error(smb2, "Transform header "
++                                                       "flags 0x%04x are not "
++                                                       "'encrypted'", th_flags);
++                                        return -1;
++                                }
++                                if (th_session != smb2->session_id) {
++                                        smb2_set_error(smb2, "Transform header "
++                                                       "for another session");
++                                        return -1;
++                                }
++                                if (smb2->spl < 52 ||
++                                    orig_size != smb2->spl - 52 ||
++                                    orig_size < SMB2_HEADER_SIZE) {
++                                        smb2_set_error(smb2, "Transform header "
++                                                       "OriginalMessageSize %u "
++                                                       "does not match its "
++                                                       "payload", orig_size);
++                                        return -1;
++                                }
++                        }
+                         /*
+                          * We have already read SMB2_HEADER_SIZE bytes, of
+                          * which the first 52 are the transform header and the
+@@ -468,6 +508,13 @@ read_more_data:
+                         smb2->recv_state = SMB2_RECV_TRFM;
+                         goto read_more_data;
+                 }
++                /* once sealing keys exist, refuse any PDU that did not arrive inside a transform */
++                if (!smb2_is_server(smb2) && smb2->seal &&
++                    smb2->enc_keys_ready && smb2->enc == NULL) {
++                        smb2_set_error(smb2, "Unencrypted PDU received on an "
++                                       "encrypted session");
++                        return -1;
++                }
+                 if (smb2_decode_header(smb2, &smb2->in.iov[smb2->in.niov - 1],
+                                        &smb2->hdr) != 0) {
+                         smb2_set_error(smb2, "Failed to decode smb2 "
+-- 
+2.56.0
+

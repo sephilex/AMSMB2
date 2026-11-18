@@ -186,6 +186,7 @@ smb2_close_context(struct smb2_context *smb2)
         smb2->message_id = 0;
         smb2->session_id = 0;
         smb2->session_flags = 0;
+        smb2->enc_keys_ready = 0;
         smb2->tree_id_top = 0;
         smb2->tree_id_cur = 0;
         smb2->tree_id[0] = 0xdeadbeef;
@@ -294,6 +295,7 @@ decode_dirents(struct smb2_context *smb2, struct smb2dir *dir,
         struct smb2_dirent_internal *ent;
         struct smb2_fileidfulldirectoryinformation fs;
         uint32_t offset = 0;
+        uint32_t name_len;
 
         do {
                 struct smb2_iovec tmp_vec _U_;
@@ -304,20 +306,36 @@ decode_dirents(struct smb2_context *smb2, struct smb2dir *dir,
                         return -1;
                 }
 
+                tmp_vec.buf = &vec->buf[offset];
+                tmp_vec.len = vec->len - offset;
+
+                memset(&fs, 0, sizeof(fs));
+                if (smb2_decode_fileidfulldirectoryinformation(smb2, &fs,
+                                                               &tmp_vec) < 0) {
+                        return -1;
+                }
+                /* A following entry must start after this one's name and
+                 * within the reply, so offsets only move forward.
+                 */
+                smb2_get_uint32(&tmp_vec, 60, &name_len);
+                if (fs.next_entry_offset &&
+                    (fs.next_entry_offset < 80 + name_len ||
+                     fs.next_entry_offset > tmp_vec.len)) {
+                        free(discard_const(fs.name));
+                        smb2_set_error(smb2, "Malformed next entry offset "
+                                       "in query reply.");
+                        return -1;
+                }
+
                 ent = calloc(1, sizeof(struct smb2_dirent_internal));
                 if (ent == NULL) {
+                        free(discard_const(fs.name));
                         smb2_set_error(smb2, "Failed to allocate "
                                        "dirent_internal");
                         return -1;
                 }
                 SMB2_LIST_ADD(&dir->entries, ent);
 
-
-                tmp_vec.buf = &vec->buf[offset];
-                tmp_vec.len = vec->len - offset;
-
-                smb2_decode_fileidfulldirectoryinformation(smb2, &fs,
-                                                           &tmp_vec);
                 /* steal the name */
                 ent->dirent.name = fs.name;
                 ent->dirent.st.smb2_type = SMB2_TYPE_FILE;
@@ -763,6 +781,26 @@ session_setup_cb(struct smb2_context *smb2, int status,
                 }
 
                 smb2_create_signing_key(smb2);
+                if (smb2->dialect >= SMB2_VERSION_0300) {
+                        smb2->enc_keys_ready = 1;
+                }
+
+                /*
+                 * This is the final leg of session setup, the first message
+                 * the server can sign. If signing is in effect it must be
+                 * signed: the SMB2_FLAGS_SIGNED bit is part of the header we
+                 * are authenticating, so letting a cleared bit mean "no
+                 * signature to check" would let an attacker on the path strip
+                 * it and skip verification. See MS-SMB2 3.2.5.3.1.
+                 */
+                if (smb2->sign && !(smb2->hdr.flags & SMB2_FLAGS_SIGNED)) {
+                        smb2_close_context(smb2);
+                        smb2_set_error(smb2, "Session setup reply is not "
+                                       "signed but signing is required");
+                        c_data->cb(smb2, -EACCES, NULL, c_data->cb_data);
+                        free_c_data(smb2, c_data);
+                        return;
+                }
 
                 if (smb2->hdr.flags & SMB2_FLAGS_SIGNED) {
                         uint8_t signature[16] _U_;
@@ -776,6 +814,7 @@ session_setup_cb(struct smb2_context *smb2, int status,
                                 return;
                         }
                         if (memcmp(&signature[0], &smb2->in.iov[1].buf[48], 16)) {
+                                smb2_close_context(smb2);
                                 smb2_set_error(smb2, "Wrong signature in received "
                                                "PDU");
                                 c_data->cb(smb2, -EINVAL, NULL, c_data->cb_data);

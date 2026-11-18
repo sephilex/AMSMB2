@@ -354,11 +354,24 @@ read_more_data:
         }
         tmpiov = iov;
 
-        /* Skip the vectors we have already read */
-        while (num_done >= tmpiov->iov_len) {
+        /* Skip the vectors we have already read.
+         *
+         * The niov test is not redundant: a zero length vector, or a state
+         * where we have already read everything we asked for, makes this
+         * walk past the last populated entry and start reading iov_len out
+         * of uninitialised stack, for as long as it keeps finding zeros.
+         * Every caller below is supposed to have queued something left to
+         * read, so if there is nothing, that is a bug rather than an
+         * on-the-wire condition.
+         */
+        while (niov > 0 && num_done >= tmpiov->iov_len) {
                 num_done -= tmpiov->iov_len;
                 tmpiov++;
                 niov--;
+        }
+        if (niov <= 0) {
+                smb2_set_error(smb2, "No io vectors left to read into");
+                return -1;
         }
 
         /* Adjust the first vector to read */
@@ -400,22 +413,107 @@ read_more_data:
         switch (smb2->recv_state) {
         case SMB2_RECV_SPL:
                 smb2->spl = be32toh(smb2->spl);
+                /*
+                 * The SPL is fully controlled by the peer and is used all over
+                 * this function to compute buffer sizes and remaining byte
+                 * counts. Reject anything that can not describe at least a
+                 * bare SMB2 header, or that is large enough to be a memory
+                 * exhaustion vector, before we act on it.
+                 */
+                if (smb2->spl < SMB2_HEADER_SIZE ||
+                    smb2->spl > smb2_recv_pdu_cap(smb2)) {
+                        smb2_set_error(smb2, "Invalid session packet length "
+                                       "%u in PDU", smb2->spl);
+                        return -1;
+                }
                 smb2->recv_state = SMB2_RECV_HEADER;
-                smb2_add_iovector(smb2, &smb2->in, &smb2->header[0],
-                                  SMB2_HEADER_SIZE, NULL);
+                if (smb2_add_iovector(smb2, &smb2->in, &smb2->header[0],
+                                  SMB2_HEADER_SIZE, NULL) == NULL) {
+                        smb2_set_error(smb2, "Too many I/O vectors when adding header");
+                        return -1;
+                }
                 goto read_more_data;
         case SMB2_RECV_HEADER:
                 if (!memcmp(smb2->in.iov[smb2->in.niov - 1].buf, smb3tfrm, 4)) {
+                        if (!smb2_is_server(smb2)) {
+                                /* validate the transform header before allocating for its payload */
+                                const uint8_t *th = smb2->in.iov[smb2->in.niov - 1].buf;
+                                uint32_t orig_size;
+                                uint16_t th_flags;
+                                uint64_t th_session;
+
+                                memcpy(&orig_size, &th[36], 4);
+                                orig_size = le32toh(orig_size);
+                                memcpy(&th_flags, &th[42], 2);
+                                th_flags = le16toh(th_flags);
+                                memcpy(&th_session, &th[44], 8);
+                                th_session = le64toh(th_session);
+                                if (!smb2->enc_keys_ready) {
+                                        smb2_set_error(smb2, "Transform header "
+                                                       "received before the "
+                                                       "encryption keys exist");
+                                        return -1;
+                                }
+                                if (th_flags != 0x0001) {
+                                        smb2_set_error(smb2, "Transform header "
+                                                       "flags 0x%04x are not "
+                                                       "'encrypted'", th_flags);
+                                        return -1;
+                                }
+                                if (th_session != smb2->session_id) {
+                                        smb2_set_error(smb2, "Transform header "
+                                                       "for another session");
+                                        return -1;
+                                }
+                                if (smb2->spl < 52 ||
+                                    orig_size != smb2->spl - 52 ||
+                                    orig_size < SMB2_HEADER_SIZE) {
+                                        smb2_set_error(smb2, "Transform header "
+                                                       "OriginalMessageSize %u "
+                                                       "does not match its "
+                                                       "payload", orig_size);
+                                        return -1;
+                                }
+                        }
+                        /*
+                         * We have already read SMB2_HEADER_SIZE bytes, of
+                         * which the first 52 are the transform header and the
+                         * remaining 12 are the start of the encrypted payload
+                         * that we copy into the payload buffer below. The
+                         * buffer must therefore be able to hold those 12
+                         * bytes.
+                         */
+                        if (smb2->spl < 52 + 12) {
+                                smb2_set_error(smb2, "Transform header PDU is "
+                                               "too short: %u", smb2->spl);
+                                return -1;
+                        }
                         smb2->in.iov[smb2->in.niov - 1].len = 52;
                         len = smb2->spl - 52;
                         smb2->in.total_size -= 12;
-                        smb2_add_iovector(smb2, &smb2->in,
-                                          malloc(len),
-                                          len, free);
+                        {
+                                uint8_t *tmp = malloc(len);
+                                if (tmp == NULL) {
+                                        smb2_set_error(smb2, "malloc failed while adding TRFM payload");
+                                        return -1;
+                                }
+                                if (smb2_add_iovector(smb2, &smb2->in,tmp,len, free) == NULL) {
+                                        free(tmp);
+                                        smb2_set_error(smb2, "Failed to add iovector for TRFM payload");
+                                        return -1;
+                                }
+                        }
                         memcpy(smb2->in.iov[smb2->in.niov - 1].buf,
                                &smb2->in.iov[smb2->in.niov - 2].buf[52], 12);
                         smb2->recv_state = SMB2_RECV_TRFM;
                         goto read_more_data;
+                }
+                /* once sealing keys exist, refuse any PDU that did not arrive inside a transform */
+                if (!smb2_is_server(smb2) && smb2->seal &&
+                    smb2->enc_keys_ready && smb2->enc == NULL) {
+                        smb2_set_error(smb2, "Unencrypted PDU received on an "
+                                       "encrypted session");
+                        return -1;
                 }
                 if (smb2_decode_header(smb2, &smb2->in.iov[smb2->in.niov - 1],
                                        &smb2->hdr) != 0) {
@@ -488,11 +586,53 @@ read_more_data:
                         if (!has_xfrmhdr) {
                                 len += SMB2_SPL_SIZE;
                         }
+                        /*
+                         * A header-only interim response (an SPL of exactly
+                         * SMB2_HEADER_SIZE, which passes the SPL check
+                         * above) leaves no padding at all. Queueing a zero
+                         * length vector for it would leave num_done equal to
+                         * total_size and send the skip loop off the end of
+                         * the work array, so just finish the PDU here.
+                         */
+                        if (len < 0) {
+                                smb2_set_error(smb2, "Negative number of PAD "
+                                               "bytes in PENDING reply");
+                                return -1;
+                        }
+                        if (len == 0) {
+                                /* Nothing to skip, so this interim reply is
+                                 * already complete. Finish it here rather
+                                 * than falling through the shared tail
+                                 * below, which assumes at least two input
+                                 * vectors and would reject a decrypted
+                                 * header-only PDU, where the only vector is
+                                 * the header itself.
+                                 */
+                                if (smb2->passthrough) {
+                                        pdu = smb2_find_pdu(smb2,
+                                                        smb2->hdr.message_id);
+                                        if (pdu) {
+                                                pdu->cb(smb2, smb2->hdr.status,
+                                                        pdu->payload,
+                                                        pdu->cb_data);
+                                        }
+                                }
+                                smb2->in.num_done = 0;
+                                return 0;
+                        }
                         /* Add padding before the next PDU */
                         smb2->recv_state = SMB2_RECV_PAD;
-                        smb2_add_iovector(smb2, &smb2->in,
-                                          malloc(len),
-                                          len, free);
+                        {
+                                uint8_t *tmp = malloc(len);
+                                if (tmp == NULL) {
+                                        smb2_set_error(smb2, "malloc failed while adding PENDING padding");
+                                        return -1;
+                                }
+                                if (smb2_add_iovector(smb2, &smb2->in,tmp, len, free) == NULL) {
+                                        free(tmp);
+                                        return -1;
+                                }
+                        }
                         goto read_more_data;
                 }
 
@@ -555,9 +695,20 @@ read_more_data:
                 }
 
                 smb2->recv_state = SMB2_RECV_FIXED;
-                smb2_add_iovector(smb2, &smb2->in,
-                                  malloc(len & 0xfffe),
-                                  len & 0xfffe, free);
+                {
+                        size_t alen = len & 0xfffe;
+                        uint8_t *tmp = malloc(alen);
+                        if (tmp == NULL) {
+                                smb2_set_error(smb2, "malloc failed while adding FIXED payload");
+                                return -1;
+                        }
+                        if (smb2_add_iovector(smb2, &smb2->in,
+                                  tmp,
+                                  alen, free) == NULL) {
+                                free(tmp);
+                                return -1;
+                        }
+                }
                 goto read_more_data;
         case SMB2_RECV_FIXED:
                 len = smb2_process_payload_fixed(smb2, pdu);
@@ -576,9 +727,11 @@ read_more_data:
                                 if (num > (size_t)len) {
                                         num = (size_t)len;
                                 }
-                                smb2_add_iovector(smb2, &smb2->in,
+                                if (smb2_add_iovector(smb2, &smb2->in,
                                                   pdu->in.iov[i].buf,
-                                                  num, NULL);
+                                                  num, NULL) == NULL) {
+                                        return -1;
+                                }
                                 len -= num;
 
                                 if (len == 0) {
@@ -588,9 +741,19 @@ read_more_data:
                         }
                         if (len > 0) {
                                 smb2->recv_state = SMB2_RECV_VARIABLE;
-                                smb2_add_iovector(smb2, &smb2->in,
-                                                  malloc(len),
-                                                  len, free);
+                                {
+                                        uint8_t *tmp = malloc(len);
+                                        if (tmp == NULL) {
+                                                smb2_set_error(smb2, "malloc failed while adding VARIABLE tail");
+                                                return -1;
+                                        }
+                                        if (smb2_add_iovector(smb2, &smb2->in,
+                                                  tmp,
+                                                  len, free) == NULL) {
+                                                free(tmp);
+                                                return -1;
+                                        }
+                                }
                                 goto read_more_data;
                         }
                 }
@@ -618,9 +781,19 @@ read_more_data:
                 if (len > 0) {
                         /* Add padding before the next PDU */
                         smb2->recv_state = SMB2_RECV_PAD;
-                        smb2_add_iovector(smb2, &smb2->in,
-                                          malloc(len),
-                                          len, free);
+                        {
+                                uint8_t *tmp = malloc(len);
+                                if (tmp == NULL) {
+                                        smb2_set_error(smb2, "malloc failed while adding PAD");
+                                        return -1;
+                                }
+                                if (smb2_add_iovector(smb2, &smb2->in,
+                                          tmp,
+                                          len, free) == NULL) {
+                                        free(tmp);
+                                        return -1;
+                                }
+                        }
                         goto read_more_data;
                 }
 
@@ -658,9 +831,18 @@ read_more_data:
                 if (len > 0) {
                         /* Add padding before the next PDU */
                         smb2->recv_state = SMB2_RECV_PAD;
-                        smb2_add_iovector(smb2, &smb2->in,
-                                          malloc(len),
-                                          len, free);
+                        uint8_t * tmp = malloc(len);
+                        if (tmp == NULL) {
+                            smb2_set_error(smb2, "malloc failed while adding PAD");
+                            return -1;
+                        }
+                        if (smb2_add_iovector(smb2, &smb2->in,
+                                              tmp,
+                                              len, free) == NULL) {
+                                free(tmp);
+                                smb2_set_error(smb2, "Failed to add iovector for PAD");
+                                return -1;
+                        }
                         goto read_more_data;
                 }
 
@@ -717,13 +899,31 @@ read_more_data:
 
         /* We don't yet have the signing key until later, once session
          * setup has completed, so we can not yet verify the signature
-         * of the final leg of session setup.
+         * of the final leg of session setup. NEGOTIATE is exempt for the
+         * same reason, and a PDU that arrived inside a transform header has
+         * already been authenticated by the AEAD tag.
+         *
+         * Everything else has to be signed once signing is in effect. Note
+         * that we must not make the check itself conditional on
+         * SMB2_FLAGS_SIGNED: that flag lives in the very header we are
+         * trying to authenticate, so treating a cleared flag as "nothing to
+         * verify" lets anyone on the path strip it from a forged PDU and
+         * bypass signing entirely. MS-SMB2 3.2.5.1.3 requires us to drop
+         * such a message instead.
          */
         if (!(smb2->session_flags & (SMB2_SESSION_FLAG_IS_GUEST | SMB2_SESSION_FLAG_IS_NULL)) &&
             smb2->sign &&
-            (smb2->hdr.flags & SMB2_FLAGS_SIGNED) &&
-            (smb2->hdr.command != SMB2_SESSION_SETUP) ) {
+            (smb2->hdr.command != SMB2_NEGOTIATE) &&
+            (smb2->hdr.command != SMB2_SESSION_SETUP) &&
+            !smb2->enc) {
                 uint8_t signature[16] _U_;
+
+                if (!(smb2->hdr.flags & SMB2_FLAGS_SIGNED)) {
+                        smb2_set_error(smb2, "PDU for command %d is not "
+                                       "signed but signing is required",
+                                       smb2->hdr.command);
+                        return -1;
+                }
                 memcpy(&signature[0], &smb2->in.iov[1 + iov_offset].buf[48], 16);
                 if (smb2_calc_signature(smb2, &smb2->in.iov[1 + iov_offset].buf[48],
                                         &smb2->in.iov[1 + iov_offset],
@@ -757,8 +957,11 @@ read_more_data:
                 /* Record at which iov we ended in this loop so we know where to start in the next */
                 iov_offset = smb2->in.niov - 1;
                 smb2->recv_state = SMB2_RECV_HEADER;
-                smb2_add_iovector(smb2, &smb2->in, &smb2->header[0],
-                                  SMB2_HEADER_SIZE, NULL);
+                if (smb2_add_iovector(smb2, &smb2->in, &smb2->header[0],
+                                  SMB2_HEADER_SIZE, NULL) == NULL) {
+                        smb2_set_error(smb2, "Too many I/O vectors when adding chained header");
+                        return -1;
+                }
                 goto read_more_data;
         }
 
@@ -793,8 +996,11 @@ smb2_read_from_socket(struct smb2_context *smb2)
                         smb2->spl = 0;
 
                         smb2_free_iovector(smb2, &smb2->in);
-                        smb2_add_iovector(smb2, &smb2->in, (uint8_t *)&smb2->spl,
-                                          SMB2_SPL_SIZE, NULL);
+                        if (smb2_add_iovector(smb2, &smb2->in, (uint8_t *)&smb2->spl,
+                                          SMB2_SPL_SIZE, NULL) == NULL) {
+                                smb2_set_error(smb2, "Too many I/O vectors when adding SPL");
+                                return -1;
+                        }
                 }
 
                 count = smb2_read_data(smb2, smb2_readv_from_socket, 0);
@@ -977,7 +1183,7 @@ smb2_service_fd(struct smb2_context *smb2, t_socket fd, int revents)
                 }
         }
 
- out:
+  out:
         if (smb2->timeout) {
                 smb2_timeout_pdus(smb2);
         }

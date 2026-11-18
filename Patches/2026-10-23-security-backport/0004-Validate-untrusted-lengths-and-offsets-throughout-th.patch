@@ -1,0 +1,988 @@
+From 4af5e251244522d065e7fa01462aa97e85a8d055 Mon Sep 17 00:00:00 2001
+From: Ronnie Sahlberg <ronniesahlberg@gmail.com>
+Date: Sat, 8 Aug 2026 09:37:50 +1000
+Subject: [PATCH 4/9] Validate untrusted lengths and offsets throughout the PDU
+ decoders
+
+Several decoders trusted length and offset fields taken straight off the
+wire, which a malicious peer could use to drive out-of-bounds accesses.
+All of these are reachable from a hostile SMB2 server against a client,
+and the NTLMSSP and negotiate-context ones are reachable pre-auth from
+any client against smb2_server.
+
+socket.c: the session packet length was never validated at all. In the
+SMB3 transform-header branch the payload buffer is sized as spl - 52 and
+then 12 bytes are unconditionally copied into it, so an SPL of 52..63
+gave a 12 byte heap write into a buffer of 0..11 bytes. This is reached
+from the very first bytes read off the socket, before negotiate. Reject
+an SPL that can not hold an SMB2 header or that exceeds SMB2_MAX_PDU_SIZE
+(the ceiling this file already applies elsewhere; comfortably above the
+1MB/8MB max_read_size real servers advertise), and check explicitly for
+the 12 bytes in the transform branch. smb3-seal.c gets the same check for
+the decrypted blob, which re-enters the state machine with enc_len
+standing in for the SPL.
+
+smb2-data-file-info.c: smb2_decode_file_stream_info() advanced by the
+wire-supplied NextEntryOffset while writing one struct per iteration.
+Callers size the array as 1 + vec->len / 24 entries, so a NextEntryOffset
+below 24 (nothing required it to be >= 24) overran the allocation.
+Require it to skip at least the fixed part of an entry and to stay in the
+buffer, and check the fixed part is present before decoding it.
+
+ntlmssp.c: ntlmssp_get_utf16_field() used the 32-bit field offset as a
+raw index with no check, so the Domain/User/Workstation fields of an
+AUTHENTICATE_MESSAGE read at an arbitrary offset. ntlmssp_authenticate_blob()
+read the 64 byte fixed part while only requiring 8 bytes, allowed the NTLM
+response offset to sit one past the end, and never bounded the response
+length, so the "temp" blob was copied out of bounds. ntlm_decode_challenge_message()
+validated the length but not the offset of the target-info block (unlike
+the target-name block just above it), and the attribute walk ignored the
+4 byte attribute header, letting inlen underflow. Bound all of them, and
+bound the target-name we append to the output buffer.
+
+asn1-ber.c/spnego-wrapper.c: a BER length was decoded without checking it
+fits in the remaining input, and the SPNEGO unwrappers handed that length
+back as the token length, so a short security buffer claiming a large
+OCTET STRING made the NTLMSSP layer read past the end.
+
+smb2-cmd-ioctl.c: the default branch of smb2_process_ioctl_variable()
+allocated output_count bytes but copied iov->len - IOV_OFFSET_IOCTL, which
+also covers the padded input buffer, overflowing whenever input_count was
+non-zero. This is the path FSCTL_PIPE_TRANSCEIVE and therefore all DCERPC
+traffic takes.
+
+smb2-cmd-query-directory.c: four error paths freed the payload without
+clearing pdu->payload, leaving a dangling pointer that smb2_free_pdu()
+frees again during teardown. Every other command file already nulls it
+first.
+
+Also fixed while in here:
+ - smb2_encode_negotiate_reply() sized the security buffer from the fixed
+   part of the reply instead of from the security buffer, and read seclen
+   uninitialized when there was no security buffer.
+ - the negotiate context loops used type/len uninitialized at the buffer
+   boundary and did not bound the context data; the NETNAME context was
+   converted with no bounds check at all.
+ - PreviousSessionId was decoded at offset 18 rather than 16, past the end
+   of the 24 byte session setup request structure.
+ - smb2_process_read_request_fixed() tested ReadChannelInfoLength before
+   decoding it, so every read request carrying channel info was rejected.
+ - the error reply byte_count was not bounded by the PDU.
+ - decode_ace() left ad_len/raw_len covering the rest of the ACL rather
+   than the ACE, and ignored a NULL sid.
+ - several (uint16_t)smb2->spl truncating casts in bounds checks.
+ - unchecked smb2_alloc_init()/malloc()/smb2_utf16_to_utf8() results in
+   the query-info, ioctl, reparse point and NTLMSSP paths.
+
+The three most severe issues were confirmed with AddressSanitizer before
+and after: the transform-header write, the stream-info overrun and the
+NTLMSSP field offset now all pass cleanly, and a well-formed stream-info
+chain still decodes as before.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+(cherry picked from commit bae5ef5d94537dcaf5fb520cfed22bb84c99e20b)
+---
+ lib/asn1-ber.c                      | 12 +++++
+ lib/ntlmssp.c                       | 73 +++++++++++++++++++++++++----
+ lib/smb2-cmd-error.c                | 11 +++++
+ lib/smb2-cmd-ioctl.c                | 26 ++++++++--
+ lib/smb2-cmd-negotiate.c            | 38 +++++++++++----
+ lib/smb2-cmd-query-directory.c      | 10 +++-
+ lib/smb2-cmd-query-info.c           | 51 ++++++++++++++++++++
+ lib/smb2-cmd-read.c                 |  6 ++-
+ lib/smb2-cmd-session-setup.c        |  9 +++-
+ lib/smb2-data-file-info.c           | 44 +++++++++++++----
+ lib/smb2-data-reparse-point.c       |  9 +++-
+ lib/smb2-data-security-descriptor.c |  8 ++++
+ lib/smb3-seal.c                     | 14 ++++++
+ lib/socket.c                        | 26 ++++++++++
+ lib/spnego-wrapper.c                | 19 +++++++-
+ 15 files changed, 320 insertions(+), 36 deletions(-)
+
+diff --git a/lib/asn1-ber.c b/lib/asn1-ber.c
+index 2f461be..550ca00 100644
+--- a/lib/asn1-ber.c
++++ b/lib/asn1-ber.c
+@@ -165,6 +165,18 @@ int asn1ber_length_from_ber(struct asn1ber_context *actx, uint32_t *len)
+         /* simple small len */
+         val = (uint32_t)b;
+     }
++    /*
++     * A BER length always describes content that follows it in the same
++     * buffer, so it can never exceed what is left. Without this check the
++     * decoded length is handed back to callers (which use it to size the
++     * token they return) while pointing past the end of the input.
++     */
++    if (actx->src_count < actx->src_tail ||
++        val > (uint32_t)(actx->src_count - actx->src_tail))
++    {
++        actx->last_error = -E2BIG;
++        return -1;
++    }
+     *len = val;
+     return 0;
+ }
+diff --git a/lib/ntlmssp.c b/lib/ntlmssp.c
+index de08f52..e73e65f 100644
+--- a/lib/ntlmssp.c
++++ b/lib/ntlmssp.c
+@@ -367,7 +367,8 @@ ntlm_decode_challenge_message(struct smb2_context *smb2, struct auth_data *auth_
+                 u32 = htole32(outoff);
+                 memcpy(&auth_data->ntlm_buf[16], &u32, 4);
+ 
+-                if (inlen > 0 && inlen < len && (outoff + inlen) < alloc_len) {
++                if (inlen > 0 && inoff < len && inlen <= len - inoff && (outoff + inlen) < alloc_len) {
++                        free(auth_data->target_name);
+                         auth_data->target_name = discard_const(smb2_utf16_to_utf8((const uint16_t *)(void *)&buf[inoff], inlen / 2));
+                         memcpy(&auth_data->ntlm_buf[outoff], &buf[inoff], inlen);
+                         outoff += inlen;
+@@ -380,18 +381,32 @@ ntlm_decode_challenge_message(struct smb2_context *smb2, struct auth_data *auth_
+ 
+                 infolen = 0;
+ 
+-                if (inlen > 0 && inlen < len && (outoff + inlen) < alloc_len) {
++                /* As for the target name above, the offset has to be validated
++                 * too and not just the length, otherwise the walk below reads
++                 * at an arbitrary offset from the challenge buffer.
++                 */
++                if (inlen > 0 && inoff < len && inlen <= len - inoff &&
++                    (outoff + inlen) < alloc_len) {
+                         /* back annotate target info field offset */
+                         u32 = htole32(outoff);
+                         memcpy(&auth_data->ntlm_buf[44], &u32, 4);
+ 
+                         /* transcode target info fields, appending our target-name */
+                         while (inlen > 0) {
++                                /* Each attribute is a 4 byte header followed
++                                 * by attr_len bytes of value, all of which
++                                 * must fit in what is left of the input, and
++                                 * the re-encoded copy must fit in the output.
++                                 */
++                                if (inlen < 4) {
++                                        break;
++                                }
+                                 memcpy(&u16, &buf[inoff], 2);
+                                 attr_code = htole16(u16);
+                                 memcpy(&u16, &buf[inoff + 2], 2);
+                                 attr_len = htole16(u16);
+-                                if (attr_len > inlen || (outoff + attr_len) > alloc_len) {
++                                if (attr_len > inlen - 4 ||
++                                    (outoff + 4 + attr_len) > alloc_len) {
+                                         /* invalid, must be out of parse? */
+                                         break;
+                                 }
+@@ -403,6 +418,14 @@ ntlm_decode_challenge_message(struct smb2_context *smb2, struct auth_data *auth_
+                                                 if (utf16_spn != NULL) {
+                                                         attr_code = 0x9; /* target-name code */
+                                                         attr_len = utf16_spn->len * 2;
++                                                        /* the target-name we append plus the
++                                                         * 4 byte end-of-list marker below have
++                                                         * to fit in the output buffer too
++                                                         */
++                                                        if ((outoff + 4 + attr_len + 4) > alloc_len) {
++                                                                free(utf16_spn);
++                                                                break;
++                                                        }
+                                                         u16 = htole16(attr_code);
+                                                         memcpy(&auth_data->ntlm_buf[outoff], &u16, 2);
+                                                         u16 = htole16(attr_len);
+@@ -415,6 +438,9 @@ ntlm_decode_challenge_message(struct smb2_context *smb2, struct auth_data *auth_
+                                                         free(utf16_spn);
+                                                 }
+                                         }
++                                        if ((outoff + 4) > alloc_len) {
++                                                break;
++                                        }
+                                         /* insert original end of list attr */
+                                         u16 = 0;
+                                         memcpy(&auth_data->ntlm_buf[outoff], &u16, 2);
+@@ -652,8 +678,10 @@ encode_ntlm_auth(struct smb2_context *smb2, time_t ti,
+                 goto finished;
+         }
+ 
+-        /* Must have at least enough bytes for server name offset */
+-        if (auth_data->ntlm_len < 47) {
++        /* Must have at least enough bytes for server name offset, which is
++         * the 4 bytes at offset 44, so we need 48 bytes and not 47.
++         */
++        if (auth_data->ntlm_len < 48) {
+                 goto finished;
+         }
+         /* get the server neg flags */
+@@ -681,7 +709,7 @@ encode_ntlm_auth(struct smb2_context *smb2, time_t ti,
+                         auth_data->client_challenge, 8,
+                         (uint8_t*)server_challenge,
+                         (uint8_t*)server_name_buf, server_name_len) < 0) {
+-                return -1;
++                goto finished;
+         }
+ 
+         smb2_hmac_md5(&auth_data->buf[8], (unsigned int)auth_data->len-8,
+@@ -992,7 +1020,12 @@ encode_ntlm_challenge(struct smb2_context *smb2, struct auth_data *auth_data)
+ 
+         /* save the target info in auth-data for later */
+         auth_data->target_info_len = auth_data->len - target_info_pos;
++        free(auth_data->target_info);
+         auth_data->target_info = malloc(auth_data->target_info_len);
++        if (auth_data->target_info == NULL) {
++                auth_data->target_info_len = 0;
++                goto finished;
++        }
+         memcpy(auth_data->target_info,
+                         auth_data->buf + target_info_pos,
+                         auth_data->target_info_len);
+@@ -1173,6 +1206,13 @@ ntlmssp_get_utf16_field(uint8_t *input_buf, int input_len, int offset, char **re
+         memcpy(&u32, &input_buf[offset + 4], 4);
+         field_off = le32toh(u32);
+         if (field_len && field_off) {
++                /* Both the offset and the length come straight off the wire
++                 * and must be verified to describe a range inside the blob.
++                 */
++                if (field_off > (uint32_t)input_len ||
++                    field_len > (uint32_t)input_len - field_off) {
++                        return;
++                }
+                 *result = (char*)smb2_utf16_to_utf8((uint16_t *)(void *)(input_buf + field_off), field_len / 2);
+         }
+ }
+@@ -1195,7 +1235,11 @@ ntlmssp_authenticate_blob(struct smb2_server *server, struct smb2_context *smb2,
+         /* uint32_t negotiate_flags; */
+         uint32_t u32;
+ 
+-        if (!input_buf || (input_len < 8) || memcmp(input_buf, "NTLMSSP", 8)) {
++        /* We unconditionally read the 64 byte fixed part of the
++         * AUTHENTICATE_MESSAGE below (up to and including the negotiate flags
++         * at offset 4*15), so insist on having all of it.
++         */
++        if (!input_buf || (input_len < 64) || memcmp(input_buf, "NTLMSSP", 8)) {
+                 return -1;
+         }
+         memcpy(&u32, &input_buf[4*2], 4);
+@@ -1243,7 +1287,7 @@ ntlmssp_authenticate_blob(struct smb2_server *server, struct smb2_context *smb2,
+         /* if no user/pw, and anonymous allowed, do anonymous */
+         if (!auth_data->user || (auth_data->user[0] == '\0') ||
+                         !smb2->password || (smb2->password[0] == '\0')) {
+-                if (server->allow_anonymous) {
++                if (server && server->allow_anonymous) {
+                         return 0;
+                 }
+                 return -1;
+@@ -1261,7 +1305,15 @@ ntlmssp_authenticate_blob(struct smb2_server *server, struct smb2_context *smb2,
+         if (field_len == 0 || field_off == 0) {
+                 return -1;
+         }
+-        if (field_off > (uint32_t)input_len) {
++        /* The response consists of a 16 byte NTProofStr followed by the
++         * client's "temp" blob. Both the offset and the length are attacker
++         * controlled, so verify the whole response lies inside the blob
++         * before we read any of it.
++         */
++        if (field_len < 16 ||
++            field_off > (uint32_t)input_len ||
++            field_len > (uint32_t)input_len - field_off) {
++                smb2_set_error(smb2, "NTLMSSP response field out of bounds");
+                 return -1;
+         }
+         /* 16 byte NTLMv2 response */
+@@ -1274,6 +1326,9 @@ ntlmssp_authenticate_blob(struct smb2_server *server, struct smb2_context *smb2,
+                         free(auth_data->client_challenge);
+                 }
+                 auth_data->client_challenge = malloc(8);
++                if (auth_data->client_challenge == NULL) {
++                        return -1;
++                }
+                 memcpy(auth_data->client_challenge, input_buf + field_off + 32, 8);
+         }
+         else {
+diff --git a/lib/smb2-cmd-error.c b/lib/smb2-cmd-error.c
+index de8d6b2..779e5c8 100644
+--- a/lib/smb2-cmd-error.c
++++ b/lib/smb2-cmd-error.c
+@@ -140,6 +140,17 @@ smb2_process_error_fixed(struct smb2_context *smb2,
+         smb2_get_uint8(iov, 2, &rep->error_context_count);
+         smb2_get_uint32(iov, 4, &rep->byte_count);
+ 
++        /* byte_count comes straight off the wire and is used as the size of
++         * the variable part, so make sure it stays within this PDU.
++         */
++        if ((uint64_t)SMB2_HEADER_SIZE + (SMB2_ERROR_REPLY_SIZE & 0xfffe) +
++            rep->byte_count > (uint64_t)smb2->spl) {
++                smb2_set_error(smb2, "Error data extends beyond end of PDU");
++                pdu->payload = NULL;
++                free(rep);
++                return -1;
++        }
++
+         return rep->byte_count;
+ }
+ 
+diff --git a/lib/smb2-cmd-ioctl.c b/lib/smb2-cmd-ioctl.c
+index f00f334..2fa6368 100644
+--- a/lib/smb2-cmd-ioctl.c
++++ b/lib/smb2-cmd-ioctl.c
+@@ -310,7 +310,8 @@ smb2_process_ioctl_variable(struct smb2_context *smb2,
+         struct smb2_iovec vec;
+         void *ptr;
+ 
+-        if (rep->output_count > iov->len - IOV_OFFSET) {
++        if (IOV_OFFSET > iov->len ||
++            rep->output_count > iov->len - IOV_OFFSET) {
+                 return -EINVAL;
+         }
+ 
+@@ -321,6 +322,9 @@ smb2_process_ioctl_variable(struct smb2_context *smb2,
+         case SMB2_FSCTL_GET_REPARSE_POINT:
+                 ptr = smb2_alloc_init(smb2,
+                                       sizeof(struct smb2_reparse_data_buffer));
++                if (ptr == NULL) {
++                        return -ENOMEM;
++                }
+                 if (smb2_decode_reparse_data_buffer(smb2, ptr, ptr, &vec)) {
+                         smb2_set_error(smb2, "could not decode reparse "
+                                        "data buffer. %s",
+@@ -333,7 +337,14 @@ smb2_process_ioctl_variable(struct smb2_context *smb2,
+                 if (ptr == NULL) {
+                         return -ENOMEM;
+                 }
+-                memcpy(ptr, &iov->buf[IOV_OFFSET], iov->len - IOV_OFFSET);
++                /*
++                 * Only copy the output buffer. iov->len also covers the
++                 * padding and any input buffer that precedes it (see the
++                 * length smb2_process_ioctl_fixed() returned), so using it
++                 * as the copy length overruns the allocation whenever
++                 * input_count is non-zero.
++                 */
++                memcpy(ptr, &iov->buf[IOV_OFFSET], rep->output_count);
+         }
+ 
+         rep->output = ptr;
+@@ -408,7 +419,8 @@ smb2_process_ioctl_request_variable(struct smb2_context *smb2,
+         void *ptr = NULL;
+         struct smb2_ioctl_validate_negotiate_info *info;
+ 
+-        if (req->input_count > iov->len - IOVREQ_OFFSET) {
++        if (IOVREQ_OFFSET > iov->len ||
++            req->input_count > iov->len - IOVREQ_OFFSET) {
+                 return -EINVAL;
+         }
+ 
+@@ -418,7 +430,15 @@ smb2_process_ioctl_request_variable(struct smb2_context *smb2,
+         switch (req->ctl_code) {
+         case SMB2_FSCTL_VALIDATE_NEGOTIATE_INFO:
+                 /* this one is handled locally regardless of proxy or not */
++                if (vec.len < 24) {
++                        smb2_set_error(smb2, "Validate negotiate info request "
++                                       "is too short");
++                        return -EINVAL;
++                }
+                 ptr = smb2_alloc_init(smb2, sizeof(struct smb2_ioctl_validate_negotiate_info));
++                if (ptr == NULL) {
++                        return -ENOMEM;
++                }
+                 info = ptr;
+                 smb2_get_uint32(&vec, 0, &info->capabilities);
+                 memcpy(info->guid, &vec.buf[4], 16);
+diff --git a/lib/smb2-cmd-negotiate.c b/lib/smb2-cmd-negotiate.c
+index c4c6577..93fb735 100644
+--- a/lib/smb2-cmd-negotiate.c
++++ b/lib/smb2-cmd-negotiate.c
+@@ -213,7 +213,7 @@ smb2_encode_negotiate_reply(struct smb2_context *smb2,
+                               struct smb2_negotiate_reply *rep)
+ {
+         uint8_t *buf;
+-        int len, seclen;
++        int len, seclen = 0;
+         struct smb2_iovec *iov;
+ 
+         len = SMB2_NEGOTIATE_REPLY_SIZE & 0xfffe;
+@@ -239,8 +239,11 @@ smb2_encode_negotiate_reply(struct smb2_context *smb2,
+         }
+ 
+         if (rep->security_buffer_length) {
+-                seclen = rep->security_buffer_length;
+-                seclen = PAD_TO_64BIT(len);
++                /* The buffer has to be sized from the security buffer we are
++                 * about to copy into it, not from the size of the fixed part
++                 * of the reply.
++                 */
++                seclen = PAD_TO_64BIT(rep->security_buffer_length);
+                 /* Security buffer */
+                 buf = malloc(seclen);
+                 if (buf == NULL) {
+@@ -339,12 +342,19 @@ smb2_parse_negotiate_contexts(struct smb2_context *smb2,
+         uint16_t type, len;
+ 
+         while (count--) {
+-                if (offset > (int)iov->len) {
+-                        smb2_set_error(smb2, "Bad len in negotiate context\n");
++                /* the 8 byte context header must be present, and the context
++                 * data it describes must fit in what is left of the buffer
++                 */
++                if (offset < 0 || (size_t)offset + 8 > iov->len) {
++                        smb2_set_error(smb2, "Bad offset in negotiate context");
+                         return -1;
+                 }
+                 smb2_get_uint16(iov, offset, &type);
+                 smb2_get_uint16(iov, offset + 2, &len);
++                if ((size_t)len > iov->len - offset - 8) {
++                        smb2_set_error(smb2, "Bad len in negotiate context");
++                        return -1;
++                }
+ 
+                 switch (type) {
+                 case SMB2_PREAUTH_INTEGRITY_CAP:
+@@ -411,7 +421,8 @@ smb2_process_negotiate_fixed(struct smb2_context *smb2,
+         smb2_get_uint16(iov, 58, &rep->security_buffer_length);
+ 
+         if (rep->security_buffer_length &&
+-            (rep->security_buffer_offset + rep->security_buffer_length > (uint16_t)smb2->spl)) {
++            ((uint32_t)rep->security_buffer_offset +
++             rep->security_buffer_length > smb2->spl)) {
+                 smb2_set_error(smb2, "Security buffer extends beyond end of "
+                                "PDU");
+                 pdu->payload = NULL;
+@@ -547,6 +558,11 @@ smb2_parse_netname_request_context(struct smb2_context *smb2,
+ {
+         char *client;
+ 
++        if (offset < 0 || len < 0 || (size_t)offset + (size_t)len > iov->len) {
++                smb2_set_error(smb2, "Netname context extends beyond the "
++                               "negotiate request");
++                return -1;
++        }
+         client = discard_const(smb2_utf16_to_utf8((uint16_t *)(void *)(iov->buf + offset), len / 2));
+         free(client);
+         return 0;
+@@ -561,10 +577,16 @@ smb2_parse_negotiate_request_contexts(struct smb2_context *smb2,
+         uint16_t type, len;
+ 
+         while (count--) {
++                /* the 8 byte context header must be present, and the context
++                 * data it describes must fit in what is left of the buffer
++                 */
++                if (offset < 0 || (size_t)offset + 8 > iov->len) {
++                        smb2_set_error(smb2, "Bad offset in negotiate context");
++                        return -1;
++                }
+                 smb2_get_uint16(iov, offset, &type);
+                 smb2_get_uint16(iov, offset + 2, &len);
+-
+-                if (offset > (int)iov->len) {
++                if ((size_t)len > iov->len - offset - 8) {
+                         smb2_set_error(smb2, "Bad len in negotiate context");
+                         return -1;
+                 }
+diff --git a/lib/smb2-cmd-query-directory.c b/lib/smb2-cmd-query-directory.c
+index 4733c43..24656cc 100644
+--- a/lib/smb2-cmd-query-directory.c
++++ b/lib/smb2-cmd-query-directory.c
+@@ -447,9 +447,11 @@ smb2_process_query_directory_fixed(struct smb2_context *smb2,
+         smb2_get_uint16(iov, 2, &rep->output_buffer_offset);
+         smb2_get_uint32(iov, 4, &rep->output_buffer_length);
+         if (rep->output_buffer_length &&
+-            (rep->output_buffer_offset + rep->output_buffer_length > smb2->spl)) {
++            ((uint64_t)rep->output_buffer_offset +
++             rep->output_buffer_length > (uint64_t)smb2->spl)) {
+                 smb2_set_error(smb2, "Output buffer extends beyond end of "
+                                "PDU");
++                pdu->payload = NULL;
+                 free(rep);
+                 return -1;
+         }
+@@ -462,6 +464,7 @@ smb2_process_query_directory_fixed(struct smb2_context *smb2,
+             (SMB2_QUERY_INFO_REPLY_SIZE & 0xfffe)) {
+                 smb2_set_error(smb2, "Output buffer overlaps with "
+                                "Query Dir reply header");
++                pdu->payload = NULL;
+                 free(rep);
+                 return -1;
+         }
+@@ -521,9 +524,11 @@ smb2_process_query_directory_request_fixed(struct smb2_context *smb2,
+         smb2_get_uint32(iov, 28, &req->output_buffer_length);
+ 
+         if (req->file_name_length &&
+-            (req->file_name_offset + req->file_name_length > (uint16_t)smb2->spl)) {
++            ((uint32_t)req->file_name_offset +
++             req->file_name_length > smb2->spl)) {
+                 smb2_set_error(smb2, "Filename extends beyond end of "
+                                "PDU");
++                pdu->payload = NULL;
+                 free(req);
+                 return -1;
+         }
+@@ -536,6 +541,7 @@ smb2_process_query_directory_request_fixed(struct smb2_context *smb2,
+             (SMB2_QUERY_DIRECTORY_REQUEST_SIZE & 0xfffe)) {
+                 smb2_set_error(smb2, "Name buffer overlaps with "
+                                "Query Dir request header");
++                pdu->payload = NULL;
+                 free(req);
+                 return -1;
+         }
+diff --git a/lib/smb2-cmd-query-info.c b/lib/smb2-cmd-query-info.c
+index 9b99236..2a8adf8 100644
+--- a/lib/smb2-cmd-query-info.c
++++ b/lib/smb2-cmd-query-info.c
+@@ -454,6 +454,9 @@ int smb2_process_query_info_variable(struct smb2_context *smb2,
+                 case SMB2_FILE_ALL_INFORMATION:
+                         ptr = smb2_alloc_init(smb2,
+                                   sizeof(struct smb2_file_all_info));
++                        if (ptr == NULL) {
++                                return -ENOMEM;
++                        }
+                         if (smb2_decode_file_all_info(smb2, ptr, ptr, &vec)) {
+                                 smb2_set_error(smb2, "could not decode file "
+                                                "all info. %s",
+@@ -468,6 +471,9 @@ int smb2_process_query_info_variable(struct smb2_context *smb2,
+                 case SMB2_FILE_BASIC_INFORMATION:
+                         ptr = smb2_alloc_init(smb2,
+                                   sizeof(struct smb2_file_basic_info));
++                        if (ptr == NULL) {
++                                return -ENOMEM;
++                        }
+                         if (smb2_decode_file_basic_info(smb2, ptr, ptr, &vec)) {
+                                 smb2_set_error(smb2, "could not decode file "
+                                                "basic info. %s",
+@@ -488,6 +494,9 @@ int smb2_process_query_info_variable(struct smb2_context *smb2,
+                 case SMB2_FILE_NETWORK_OPEN_INFORMATION:
+                         ptr = smb2_alloc_init(smb2,
+                                   sizeof(struct smb2_file_all_info));
++                        if (ptr == NULL) {
++                                return -ENOMEM;
++                        }
+                         if (smb2_decode_file_network_open_info(smb2, ptr, ptr, &vec)) {
+                                 smb2_set_error(smb2, "could not decode file "
+                                                "network open info. %s",
+@@ -498,6 +507,9 @@ int smb2_process_query_info_variable(struct smb2_context *smb2,
+                 case SMB2_FILE_NORMALIZED_NAME_INFORMATION:
+                         ptr = smb2_alloc_init(smb2,
+                                   sizeof(struct smb2_file_name_info));
++                        if (ptr == NULL) {
++                                return -ENOMEM;
++                        }
+                         if (smb2_decode_file_normalized_name_info(smb2, ptr, ptr, &vec)) {
+                                 smb2_set_error(smb2, "could not decode file "
+                                                "normalized name info. %s",
+@@ -514,6 +526,9 @@ int smb2_process_query_info_variable(struct smb2_context *smb2,
+                 case SMB2_FILE_POSITION_INFORMATION:
+                         ptr = smb2_alloc_init(smb2,
+                                   sizeof(struct smb2_file_position_info));
++                        if (ptr == NULL) {
++                                return -ENOMEM;
++                        }
+                         if (smb2_decode_file_position_info(smb2, ptr, ptr,
+                                                            &vec)) {
+                                 smb2_set_error(smb2, "could not decode file "
+@@ -525,6 +540,9 @@ int smb2_process_query_info_variable(struct smb2_context *smb2,
+                 case SMB2_FILE_STANDARD_INFORMATION:
+                         ptr = smb2_alloc_init(smb2,
+                                   sizeof(struct smb2_file_standard_info));
++                        if (ptr == NULL) {
++                                return -ENOMEM;
++                        }
+                         if (smb2_decode_file_standard_info(smb2, ptr, ptr,
+                                                            &vec)) {
+                                 smb2_set_error(smb2, "could not decode file "
+@@ -537,6 +555,9 @@ int smb2_process_query_info_variable(struct smb2_context *smb2,
+                         /* we would have to parse the chain to get proper alloc size, so just
+                          * massively over-alloc based on vec size */
+                         ptr = smb2_alloc_init(smb2, (1 + (vec.len / 24)) * sizeof(struct smb2_file_stream_info));
++                        if (ptr == NULL) {
++                                return -ENOMEM;
++                        }
+                         if (smb2_decode_file_stream_info(smb2, ptr, ptr, &vec)) {
+                                 smb2_set_error(smb2, "could not decode file "
+                                                "stream info. %s",
+@@ -555,6 +576,9 @@ int smb2_process_query_info_variable(struct smb2_context *smb2,
+                 case SMB2_FILE_FS_ATTRIBUTE_INFORMATION:
+                         ptr = smb2_alloc_init(smb2,
+                                   sizeof(struct smb2_file_fs_attribute_info));
++                        if (ptr == NULL) {
++                                return -ENOMEM;
++                        }
+                         if (smb2_decode_file_fs_attribute_info(smb2, ptr, ptr,
+                                                           &vec)) {
+                                 smb2_set_error(smb2, "could not decode file "
+@@ -566,6 +590,9 @@ int smb2_process_query_info_variable(struct smb2_context *smb2,
+                 case SMB2_FILE_FS_CONTROL_INFORMATION:
+                         ptr = smb2_alloc_init(smb2,
+                                   sizeof(struct smb2_file_fs_control_info));
++                        if (ptr == NULL) {
++                                return -ENOMEM;
++                        }
+                         if (smb2_decode_file_fs_control_info(smb2, ptr, ptr,
+                                                           &vec)) {
+                                 smb2_set_error(smb2, "could not decode file "
+@@ -577,6 +604,9 @@ int smb2_process_query_info_variable(struct smb2_context *smb2,
+                 case SMB2_FILE_FS_DEVICE_INFORMATION:
+                         ptr = smb2_alloc_init(smb2,
+                                   sizeof(struct smb2_file_fs_device_info));
++                        if (ptr == NULL) {
++                                return -ENOMEM;
++                        }
+                         if (smb2_decode_file_fs_device_info(smb2, ptr, ptr,
+                                                           &vec)) {
+                                 smb2_set_error(smb2, "could not decode file "
+@@ -588,6 +618,9 @@ int smb2_process_query_info_variable(struct smb2_context *smb2,
+                 case SMB2_FILE_FS_FULL_SIZE_INFORMATION:
+                         ptr = smb2_alloc_init(smb2,
+                                   sizeof(struct smb2_file_fs_full_size_info));
++                        if (ptr == NULL) {
++                                return -ENOMEM;
++                        }
+                         if (smb2_decode_file_fs_full_size_info(smb2, ptr, ptr,
+                                                                &vec)) {
+                                 smb2_set_error(smb2, "could not decode file "
+@@ -599,6 +632,9 @@ int smb2_process_query_info_variable(struct smb2_context *smb2,
+                 case SMB2_FILE_FS_OBJECT_ID_INFORMATION:
+                         ptr = smb2_alloc_init(smb2,
+                                   sizeof(struct smb2_file_fs_object_id_info));
++                        if (ptr == NULL) {
++                                return -ENOMEM;
++                        }
+                         if (smb2_decode_file_fs_object_id_info(smb2, ptr, ptr,
+                                                                  &vec)) {
+                                 smb2_set_error(smb2, "could not decode file "
+@@ -610,6 +646,9 @@ int smb2_process_query_info_variable(struct smb2_context *smb2,
+                 case SMB2_FILE_FS_SECTOR_SIZE_INFORMATION:
+                         ptr = smb2_alloc_init(smb2,
+                                   sizeof(struct smb2_file_fs_sector_size_info));
++                        if (ptr == NULL) {
++                                return -ENOMEM;
++                        }
+                         if (smb2_decode_file_fs_sector_size_info(smb2, ptr, ptr,
+                                                                  &vec)) {
+                                 smb2_set_error(smb2, "could not decode file "
+@@ -621,6 +660,9 @@ int smb2_process_query_info_variable(struct smb2_context *smb2,
+                 case SMB2_FILE_FS_SIZE_INFORMATION:
+                         ptr = smb2_alloc_init(smb2,
+                                   sizeof(struct smb2_file_fs_size_info));
++                        if (ptr == NULL) {
++                                return -ENOMEM;
++                        }
+                         if (smb2_decode_file_fs_size_info(smb2, ptr, ptr,
+                                                           &vec)) {
+                                 smb2_set_error(smb2, "could not decode file "
+@@ -632,6 +674,9 @@ int smb2_process_query_info_variable(struct smb2_context *smb2,
+                 case SMB2_FILE_FS_VOLUME_INFORMATION:
+                         ptr = smb2_alloc_init(smb2,
+                                   sizeof(struct smb2_file_fs_volume_info));
++                        if (ptr == NULL) {
++                                return -ENOMEM;
++                        }
+                         if (smb2_decode_file_fs_volume_info(smb2, ptr, ptr,
+                                                             &vec)) {
+                                 smb2_set_error(smb2, "could not decode file "
+@@ -652,6 +697,9 @@ int smb2_process_query_info_variable(struct smb2_context *smb2,
+                 }
+                 ptr = smb2_alloc_init(smb2,
+                                       sizeof(struct smb2_security_descriptor));
++                if (ptr == NULL) {
++                        return -ENOMEM;
++                }
+                 if (smb2_decode_security_descriptor(smb2, ptr, ptr, &vec)) {
+                         smb2_set_error(smb2, "could not decode security "
+                                        "descriptor. %s",
+@@ -671,6 +719,9 @@ int smb2_process_query_info_variable(struct smb2_context *smb2,
+                 if (smb2->passthrough) {
+                         ptr = smb2_alloc_init(smb2,
+                                         rep->output_buffer_length);
++                        if (ptr == NULL) {
++                                return -ENOMEM;
++                        }
+                         memcpy(ptr, vec.buf, vec.len);
+                 } else {
+                         smb2_set_error(smb2, "Can not decode info_type/"
+diff --git a/lib/smb2-cmd-read.c b/lib/smb2-cmd-read.c
+index 720d345..d6e8a05 100644
+--- a/lib/smb2-cmd-read.c
++++ b/lib/smb2-cmd-read.c
+@@ -351,11 +351,15 @@ smb2_process_read_request_fixed(struct smb2_context *smb2,
+         smb2_get_uint32(iov, 32, &req->minimum_count);
+         smb2_get_uint32(iov, 36, &req->channel);
+         smb2_get_uint32(iov, 40, &req->remaining_bytes);
++        /* The length has to be read before it can be tested, otherwise the
++         * offset is never decoded and every request that carries channel
++         * info gets rejected below.
++         */
++        smb2_get_uint16(iov, 46, &req->read_channel_info_length);
+         if (req->read_channel_info_length) {
+                 req->read_channel_info_offset = (SMB2_READ_REQUEST_SIZE & 0xfffffffe) + SMB2_HEADER_SIZE;
+                 smb2_get_uint16(iov, 44, &req->read_channel_info_offset);
+         }
+-        smb2_get_uint16(iov, 46, &req->read_channel_info_length);
+ 
+         if (req->length > smb2->max_read_size) {
+                 smb2_set_error(smb2, "can not read more than %d bytes", smb2->max_read_size);
+diff --git a/lib/smb2-cmd-session-setup.c b/lib/smb2-cmd-session-setup.c
+index 9244283..1482964 100644
+--- a/lib/smb2-cmd-session-setup.c
++++ b/lib/smb2-cmd-session-setup.c
+@@ -242,7 +242,8 @@ smb2_process_session_setup_fixed(struct smb2_context *smb2,
+         smb2_get_uint16(iov, 4, &rep->security_buffer_offset);
+         smb2_get_uint16(iov, 6, &rep->security_buffer_length);
+         if (rep->security_buffer_length &&
+-            (rep->security_buffer_offset + rep->security_buffer_length > (uint16_t)smb2->spl)) {
++            ((uint32_t)rep->security_buffer_offset +
++             rep->security_buffer_length > smb2->spl)) {
+                 smb2_set_error(smb2, "Security buffer extends beyond end of "
+                                "PDU");
+                 pdu->payload = NULL;
+@@ -313,7 +314,11 @@ smb2_process_session_setup_request_fixed(struct smb2_context *smb2,
+         smb2_get_uint32(iov, 8, &req->channel);
+ /*        smb2_get_uint16(iov, 12, &req->security_buffer_offset); */
+         smb2_get_uint16(iov, 14, &req->security_buffer_length);
+-        smb2_get_uint64(iov, 18, &req->previous_session_id);
++        /* PreviousSessionId is at offset 16, which is also where
++         * smb2_encode_session_setup_request() writes it. Reading it at 18
++         * ran off the end of the 24 byte structure and left it unset.
++         */
++        smb2_get_uint64(iov, 16, &req->previous_session_id);
+ 
+         return req->security_buffer_length;
+ }
+diff --git a/lib/smb2-data-file-info.c b/lib/smb2-data-file-info.c
+index 759da1a..2cfb4b3 100644
+--- a/lib/smb2-data-file-info.c
++++ b/lib/smb2-data-file-info.c
+@@ -153,23 +153,33 @@ smb2_decode_file_stream_info(struct smb2_context *smb2,
+                                struct smb2_file_stream_info *fs,
+                                struct smb2_iovec *vec)
+ {
+-        int offset = 0;
++        size_t offset = 0;
+         uint32_t our_offset = 0;
+         uint32_t next_offset;
+         int name_len;
+         const char *name;
+ 
+         do {
+-                smb2_get_uint32(vec, offset + 0, &next_offset);
+-                smb2_get_uint32(vec, offset + 4, &fs->stream_name_length);
+-                smb2_get_uint64(vec, offset + 8, &fs->stream_size);
+-                smb2_get_uint64(vec, offset + 16, &fs->stream_allocation_size);
++                size_t avail;
++
++                /* The 24 byte fixed part of the entry must be present. */
++                if (offset + 24 > vec->len) {
++                        smb2_set_error(smb2, "Not enough data for stream "
++                                       "info entry");
++                        return -1;
++                }
++                next_offset = 0;
++                smb2_get_uint32(vec, (int)offset + 0, &next_offset);
++                smb2_get_uint32(vec, (int)offset + 4, &fs->stream_name_length);
++                smb2_get_uint64(vec, (int)offset + 8, &fs->stream_size);
++                smb2_get_uint64(vec, (int)offset + 16,
++                                &fs->stream_allocation_size);
+ 
+                 if (fs->stream_name_length > 0) {
+-                        name_len = fs->stream_name_length;
+-                        if (vec->len < (offset + 24 + name_len)) {
+-                                name_len = (int)vec->len - (int)offset - 24;
+-                        }
++                        /* The name follows the fixed part of the entry. */
++                        avail = vec->len - offset - 24;
++                        name_len = (fs->stream_name_length > avail) ?
++                                (int)avail : (int)fs->stream_name_length;
+                         if (name_len > 0) {
+                                 name = smb2_utf16_to_utf8(
+                                         (uint16_t *)(void *)&vec->buf[offset + 24],
+@@ -193,6 +203,22 @@ smb2_decode_file_stream_info(struct smb2_context *smb2,
+                 }
+ 
+                 if (next_offset) {
++                        /*
++                         * NextEntryOffset has to skip at least the 24 byte
++                         * fixed part of the entry we just decoded, and must
++                         * stay inside the buffer. Callers size the output
++                         * array as 1 + vec->len / 24 entries, so a smaller
++                         * NextEntryOffset would let a malicious server drive
++                         * many more iterations than there are entries and
++                         * walk 'fs' off the end of that allocation.
++                         */
++                        if (next_offset < 24 ||
++                            next_offset > vec->len - offset) {
++                                smb2_set_error(smb2, "Invalid NextEntryOffset "
++                                               "%u in stream info",
++                                               next_offset);
++                                return -1;
++                        }
+                         offset += next_offset;
+ 
+                         /* note - since name is now a separate alloc, our offset is just
+diff --git a/lib/smb2-data-reparse-point.c b/lib/smb2-data-reparse-point.c
+index 13e5abf..5819e80 100644
+--- a/lib/smb2-data-reparse-point.c
++++ b/lib/smb2-data-reparse-point.c
+@@ -69,7 +69,8 @@ smb2_decode_reparse_data_buffer(struct smb2_context *smb2,
+         smb2_get_uint32(vec, 0, &rp->reparse_tag);
+         smb2_get_uint16(vec, 4, &rp->reparse_data_length);
+ 
+-        if ((uint16_t)vec->len < rp->reparse_data_length + 8) {
++        /* Do not truncate vec->len to 16 bits for this comparison. */
++        if (vec->len < (size_t)rp->reparse_data_length + 8) {
+                 return -1;
+         }
+         switch (rp->reparse_tag) {
+@@ -87,6 +88,9 @@ smb2_decode_reparse_data_buffer(struct smb2_context *smb2,
+ 
+                 tmp = smb2_utf16_to_utf8((uint16_t *)(void *)(&vec->buf[suboffset + 20]),
+                                    sublen / 2);
++                if (tmp == NULL) {
++                        return -1;
++                }
+                 rp->symlink.subname = smb2_alloc_data(smb2, rp,
+                                                       strlen(tmp) + 1);
+                 if (rp->symlink.subname == NULL) {
+@@ -103,6 +107,9 @@ smb2_decode_reparse_data_buffer(struct smb2_context *smb2,
+                 }
+                 tmp = smb2_utf16_to_utf8((uint16_t *)(void *)(&vec->buf[printoffset + 20]),
+                                    printlen / 2);
++                if (tmp == NULL) {
++                        return -1;
++                }
+                 rp->symlink.printname = smb2_alloc_data(smb2, rp,
+                                                         strlen(tmp) + 1);
+                 if (rp->symlink.printname == NULL) {
+diff --git a/lib/smb2-data-security-descriptor.c b/lib/smb2-data-security-descriptor.c
+index 2e34df0..704291c 100644
+--- a/lib/smb2-data-security-descriptor.c
++++ b/lib/smb2-data-security-descriptor.c
+@@ -141,6 +141,11 @@ decode_ace(struct smb2_context *smb2, void *memctx, struct smb2_iovec *vec)
+         }
+         v.len -= 4;
+         v.buf = &v.buf[4];
++        /* An ACE only owns ace_size bytes, 4 of which were the header we just
++         * skipped. Without clamping here the "rest of the buffer" cases below
++         * (ad_len/raw_len) swallow every following ACE as well.
++         */
++        v.len = ace_size - 4;
+ 
+         /* decode the content of the ace */
+         /* TODO: have a default case where we just keep the raw blob */
+@@ -198,6 +203,9 @@ decode_ace(struct smb2_context *smb2, void *memctx, struct smb2_iovec *vec)
+                 v.len -= 4;
+                 v.buf = &v.buf[4];
+                 ace->sid = decode_sid(smb2, memctx, &v);
++                if (ace->sid == NULL) {
++                        return NULL;
++                }
+ 
+                 ace->ad_len = v.len;
+                 ace->ad_data = smb2_alloc_data(smb2, memctx, ace->ad_len);
+diff --git a/lib/smb3-seal.c b/lib/smb3-seal.c
+index b894f5f..cde7be7 100644
+--- a/lib/smb3-seal.c
++++ b/lib/smb3-seal.c
+@@ -146,6 +146,20 @@ smb3_decrypt_pdu(struct smb2_context *smb2)
+                 smb2->in.iov[smb2->in.niov - 1].free = NULL;
+                 smb2_free_iovector(smb2, &smb2->in);
+ 
++                /*
++                 * The decrypted blob is fed back through the same receive
++                 * state machine with enc_len standing in for the SPL, so it
++                 * needs the same sanity check the on-the-wire SPL gets.
++                 */
++                if (smb2->enc_len < SMB2_HEADER_SIZE ||
++                    smb2->enc_len > SMB2_MAX_PDU_SIZE) {
++                        smb2_set_error(smb2, "Invalid decrypted PDU length %zu",
++                                       smb2->enc_len);
++                        free(smb2->enc);
++                        smb2->enc = NULL;
++                        return -1;
++                }
++
+                 smb2->spl = (uint32_t)smb2->enc_len;
+                 smb2->recv_state = SMB2_RECV_HEADER;
+                 if (smb2_add_iovector(smb2, &smb2->in, &smb2->header[0],
+diff --git a/lib/socket.c b/lib/socket.c
+index b2a3ed9..468c578 100644
+--- a/lib/socket.c
++++ b/lib/socket.c
+@@ -400,6 +400,19 @@ read_more_data:
+         switch (smb2->recv_state) {
+         case SMB2_RECV_SPL:
+                 smb2->spl = be32toh(smb2->spl);
++                /*
++                 * The SPL is fully controlled by the peer and is used all over
++                 * this function to compute buffer sizes and remaining byte
++                 * counts. Reject anything that can not describe at least a
++                 * bare SMB2 header, or that is large enough to be a memory
++                 * exhaustion vector, before we act on it.
++                 */
++                if (smb2->spl < SMB2_HEADER_SIZE ||
++                    smb2->spl > SMB2_MAX_PDU_SIZE) {
++                        smb2_set_error(smb2, "Invalid session packet length "
++                                       "%u in PDU", smb2->spl);
++                        return -1;
++                }
+                 smb2->recv_state = SMB2_RECV_HEADER;
+                 if (smb2_add_iovector(smb2, &smb2->in, &smb2->header[0],
+                                   SMB2_HEADER_SIZE, NULL) == NULL) {
+@@ -409,6 +422,19 @@ read_more_data:
+                 goto read_more_data;
+         case SMB2_RECV_HEADER:
+                 if (!memcmp(smb2->in.iov[smb2->in.niov - 1].buf, smb3tfrm, 4)) {
++                        /*
++                         * We have already read SMB2_HEADER_SIZE bytes, of
++                         * which the first 52 are the transform header and the
++                         * remaining 12 are the start of the encrypted payload
++                         * that we copy into the payload buffer below. The
++                         * buffer must therefore be able to hold those 12
++                         * bytes.
++                         */
++                        if (smb2->spl < 52 + 12) {
++                                smb2_set_error(smb2, "Transform header PDU is "
++                                               "too short: %u", smb2->spl);
++                                return -1;
++                        }
+                         smb2->in.iov[smb2->in.niov - 1].len = 52;
+                         len = smb2->spl - 52;
+                         smb2->in.total_size -= 12;
+diff --git a/lib/spnego-wrapper.c b/lib/spnego-wrapper.c
+index 66e87af..8c25ba4 100644
+--- a/lib/spnego-wrapper.c
++++ b/lib/spnego-wrapper.c
+@@ -505,6 +505,15 @@ smb2_spnego_unwrap_targ(struct smb2_context *smb2, const uint8_t *spnego,
+                 case ASN1_CONTEXT(2):
+                         /* response token */
+                         require_typeandlen(&asn_decoder, asnOCTET_STRING, 8, fail);
++                        /* the token length is returned to the caller, which
++                         * reads that many bytes, so it must not run past the
++                         * end of the blob we were given
++                         */
++                        if (typelen > (uint32_t)(asn_decoder.src_count -
++                                                 asn_decoder.src_tail)) {
++                                fail_line = __LINE__;
++                                goto fail;
++                        }
+                         *token  = asn_decoder.src + asn_decoder.src_tail;
+                         token_len = typelen;
+                         break;
+@@ -533,7 +542,7 @@ smb2_spnego_unwrap_gssapi(struct smb2_context *smb2, const uint8_t *spnego,
+         int decode_pos;
+         int mech_bytes;
+         uint32_t mechs = 0;
+-        int fail_line;
++        int fail_line = 0;
+         int ret;
+ 
+         memset(&asn_decoder, 0, sizeof(asn_decoder));
+@@ -579,6 +588,14 @@ smb2_spnego_unwrap_gssapi(struct smb2_context *smb2, const uint8_t *spnego,
+                         /* mech token, note we expect NTLMSSP (7 bytes) at least here */
+                         require_typeandlen(&asn_decoder, ASN1_CONTEXT(2), 10, fail);
+                         require_typeandlen(&asn_decoder, asnOCTET_STRING, 7, fail);
++                        /* as in unwrap_targ, the length we return bounds how
++                         * much of this buffer the caller will read
++                         */
++                        if (typelen > (uint32_t)(asn_decoder.src_count -
++                                                 asn_decoder.src_tail)) {
++                                fail_line = __LINE__;
++                                goto fail;
++                        }
+                         *token  = asn_decoder.src + asn_decoder.src_tail;
+                 }
+                 return typelen;
+-- 
+2.56.0
+

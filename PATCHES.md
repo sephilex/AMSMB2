@@ -103,3 +103,37 @@ diff --git a/lib/socket.c b/lib/socket.c
              (smb2->hdr.command != SMB2_SESSION_SETUP) ) {
                  uint8_t signature[16] _U_;
 ```
+
+## Security backport (2026-10-23)
+
+Targeted upstream hardening for audit findings R4-001 to R4-004 (`docs/m6/audit-20261022/`), applied on top of the guest/anonymous signing patch above. libsmb2 was **not** upgraded as a whole: most of the ~400 later upstream commits are libdcerpc, server-side and transport (QUIC/SMB Direct) work outside the AMSMB2 client path.
+
+The complete series, in application order, is kept as `git format-patch` files in `Patches/2026-10-23-security-backport/`. To reproduce the vendored tree: check out upstream `aff9fa6`, apply the guest patch above, then `git am Patches/2026-10-23-security-backport/*.patch`; the result is byte-identical to `Dependencies/libsmb2` (two trailing-whitespace warnings come from upstream `5e75eeb`).
+
+| # | Upstream commit | Summary | Audit item |
+| --- | --- | --- | --- |
+| 1 | [`5e75eebf922b338cdb548d60cffb3b997d2a12e8`](https://github.com/sahlberg/libsmb2/commit/5e75eebf922b338cdb548d60cffb3b997d2a12e8) | Bound `smb2_add_iovector` against chained PDUs | R4-001 (iov capacity) |
+| 2 | [`883e787426df52dd19206234d7278d46ac997668`](https://github.com/sahlberg/libsmb2/commit/883e787426df52dd19206234d7278d46ac997668) | NULL checks for every `smb2_add_iovector` caller | R4-001 |
+| 3 | [`39d95961d7bdcdb330a9226d2f74fc40797ea5ee`](https://github.com/sahlberg/libsmb2/commit/39d95961d7bdcdb330a9226d2f74fc40797ea5ee) | Free buffers when `smb2_add_iovector` fails | R4-001 |
+| 4 | [`bae5ef5d94537dcaf5fb520cfed22bb84c99e20b`](https://github.com/sahlberg/libsmb2/commit/bae5ef5d94537dcaf5fb520cfed22bb84c99e20b) | Validate untrusted lengths/offsets in PDU decoders; QUERY_DIRECTORY clears `pdu->payload` before freeing | R4-001, R4-003 |
+| 5 | [`053d960087e450082b02aecd711740339ec7ad8f`](https://github.com/sahlberg/libsmb2/commit/053d960087e450082b02aecd711740339ec7ad8f) | Require a signature instead of trusting a cleared `SMB2_FLAGS_SIGNED` | R4-002 (signing) |
+| 6 | [`09424faccbd377bc0bbd576f1fc20838ca483ab8`](https://github.com/sahlberg/libsmb2/commit/09424faccbd377bc0bbd576f1fc20838ca483ab8) | No zero-length pad vector; bounded iovec skip loop | R4-001 |
+| 7 | [`7a970456c171152d033e4e02e540e00253aabd6a`](https://github.com/sahlberg/libsmb2/commit/7a970456c171152d033e4e02e540e00253aabd6a) | Refuse nested SMB3 transform headers | R4-001 |
+| 8 | [`e94eee9465d55ed094ace2c038a8705b4822dada`](https://github.com/sahlberg/libsmb2/commit/e94eee9465d55ed094ace2c038a8705b4822dada) | Refuse plaintext once sealing keys exist; validate transform flags/SessionId/OriginalMessageSize before allocating; cap receive lengths | R4-001, R4-002 (encryption) |
+| 9 | local | `decode_dirents` checks decoder errors and bounds `next_entry_offset` | R4-004 (still unfixed upstream) |
+
+Conflict resolutions (all in files the series touches; see the patch files for the exact result):
+
+- `lib/socket.c`, no-matching-PDU branch (commits 3, 6, 8): upstream's version depends on later cancelled-PDU and compound-ordering work that is not vendored. The existing behaviour (fail with "no matching PDU found") is kept, so the queued-padding path those commits harden is not reachable here.
+- `lib/socket.c`, receive signature check (commit 5): upstream's rule — skip only NEGOTIATE, SESSION_SETUP and PDUs that arrived inside a transform, otherwise reject a missing signature — is combined with the guest/anonymous exclusion above. Upstream relies on guest sessions failing earlier because of a zero session key; the guest patch skips that derivation, so the exclusion must stay. The new final-leg SESSION_SETUP check in `lib/libsmb2.c` sits inside the guest-excluded block and needed no change.
+- `lib/libsmb2.c`, `smb2_close_context` (commit 8): both `session_flags` and the new `enc_keys_ready` are reset.
+- `lib/ntlmssp.c` (commit 4): upstream's offset check was taken as is.
+- `lib/smb2-cmd-ioctl.c` (commit 4): upstream's checks were taken with the vendored macro names `IOV_OFFSET` / `IOVREQ_OFFSET` (upstream renamed them later in `37503b3`).
+
+Local patch 9 (`lib/libsmb2.c`, `lib/smb2-cmd-query-directory.c`): `smb2_decode_fileidfulldirectoryinformation` rejects entries shorter than the 80-byte fixed part and fails when the name allocation fails; `decode_dirents` zeroes `fs` per entry, propagates the decoder error, requires a non-zero `next_entry_offset` to start after the current name and stay within the reply, and only then allocates and links the entry that takes ownership of the name. Entry alignment is not enforced, to stay tolerant of servers that pad differently.
+
+Verification (2026-10-23):
+
+- `project/Vendor/AMSMB2-Verify/Offline/offline.sh` builds the vendored tree with ASan/UBSan and feeds malformed replies: valid and invalid directory entries, a rejected QUERY_DIRECTORY fixed part, short transform frames, a transform before encryption keys exist and a plaintext reply on a sealed session. All 11 checks pass. Against the pre-backport tree (`LIBSMB2_DIR=<aff9fa6 + guest patch> OFFLINE_CFLAGS=-DOFFLINE_BASELINE`) all three groups crash: double free in `free_smb2dir` (R4-004), double free in `smb2_free_pdu` (R4-003), heap-buffer-overflow at `socket.c:415` (R4-001).
+- `project/Vendor/AMSMB2-Verify/verify.sh after` and `mandatory` against the local Samba container: guest, authenticated, rejected password, empty credentials and mandatory signing all pass with exact listing and content.
+- Not covered: a live server forcing encryption, a man-in-the-middle stripping `SMB2_FLAGS_SIGNED` (only the code path is covered), Kerberos, and real NAS devices.

@@ -1,0 +1,123 @@
+From fef886bb3e04027fd5bef7c2487956bebf91703f Mon Sep 17 00:00:00 2001
+From: Ronnie Sahlberg <ronniesahlberg@gmail.com>
+Date: Fri, 14 Aug 2026 03:38:56 +1000
+Subject: [PATCH 5/9] Do not skip signature verification when the peer clears
+ SMB2_FLAGS_SIGNED
+
+The receive path only verified a signature if SMB2_FLAGS_SIGNED was set
+in the header of the PDU it was about to verify:
+
+    if (smb2->sign &&
+        (smb2->hdr.flags & SMB2_FLAGS_SIGNED) &&
+        (smb2->hdr.command != SMB2_SESSION_SETUP)) {
+
+That flag lives in the very header we are authenticating, so an attacker
+on the path can simply clear it in a forged reply and the whole
+comparison block is skipped. This was the only receive-side signature
+check in the library, so with smb2->sign set we still signed everything
+we sent but validated nothing we received. MS-SMB2 3.2.5.1.3 requires
+dropping such a message instead.
+
+Require the flag rather than testing it. NEGOTIATE and SESSION_SETUP stay
+exempt because there is no session key yet, and a PDU that arrived inside
+a transform header is skipped because the AES-CCM tag has already
+authenticated it. Everything else must be signed once signing is in
+effect, in both the client and the server role.
+
+session_setup_cb() had the same shape for the final session setup leg,
+which is the first message the server can sign, so require it there too.
+A bad signature there now also closes the context instead of only
+reporting the failure to the connect callback.
+
+Guest and anonymous sessions need no exemption: they produce a zero
+session key, so have_valid_session_key already fails the connect before
+any of this is reached.
+
+Note this also tightens the server role - a client that negotiated
+signing must now sign its requests, per MS-SMB2 3.3.5.2.4.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+(cherry picked from commit 053d960087e450082b02aecd711740339ec7ad8f)
+---
+ lib/libsmb2.c | 18 ++++++++++++++++++
+ lib/socket.c  | 24 +++++++++++++++++++++---
+ 2 files changed, 39 insertions(+), 3 deletions(-)
+
+diff --git a/lib/libsmb2.c b/lib/libsmb2.c
+index 40d060c..0f8a307 100644
+--- a/lib/libsmb2.c
++++ b/lib/libsmb2.c
+@@ -764,6 +764,23 @@ session_setup_cb(struct smb2_context *smb2, int status,
+ 
+                 smb2_create_signing_key(smb2);
+ 
++                /*
++                 * This is the final leg of session setup, the first message
++                 * the server can sign. If signing is in effect it must be
++                 * signed: the SMB2_FLAGS_SIGNED bit is part of the header we
++                 * are authenticating, so letting a cleared bit mean "no
++                 * signature to check" would let an attacker on the path strip
++                 * it and skip verification. See MS-SMB2 3.2.5.3.1.
++                 */
++                if (smb2->sign && !(smb2->hdr.flags & SMB2_FLAGS_SIGNED)) {
++                        smb2_close_context(smb2);
++                        smb2_set_error(smb2, "Session setup reply is not "
++                                       "signed but signing is required");
++                        c_data->cb(smb2, -EACCES, NULL, c_data->cb_data);
++                        free_c_data(smb2, c_data);
++                        return;
++                }
++
+                 if (smb2->hdr.flags & SMB2_FLAGS_SIGNED) {
+                         uint8_t signature[16] _U_;
+ 
+@@ -776,6 +793,7 @@ session_setup_cb(struct smb2_context *smb2, int status,
+                                 return;
+                         }
+                         if (memcmp(&signature[0], &smb2->in.iov[1].buf[48], 16)) {
++                                smb2_close_context(smb2);
+                                 smb2_set_error(smb2, "Wrong signature in received "
+                                                "PDU");
+                                 c_data->cb(smb2, -EINVAL, NULL, c_data->cb_data);
+diff --git a/lib/socket.c b/lib/socket.c
+index 468c578..4669a65 100644
+--- a/lib/socket.c
++++ b/lib/socket.c
+@@ -805,13 +805,31 @@ read_more_data:
+ 
+         /* We don't yet have the signing key until later, once session
+          * setup has completed, so we can not yet verify the signature
+-         * of the final leg of session setup.
++         * of the final leg of session setup. NEGOTIATE is exempt for the
++         * same reason, and a PDU that arrived inside a transform header has
++         * already been authenticated by the AEAD tag.
++         *
++         * Everything else has to be signed once signing is in effect. Note
++         * that we must not make the check itself conditional on
++         * SMB2_FLAGS_SIGNED: that flag lives in the very header we are
++         * trying to authenticate, so treating a cleared flag as "nothing to
++         * verify" lets anyone on the path strip it from a forged PDU and
++         * bypass signing entirely. MS-SMB2 3.2.5.1.3 requires us to drop
++         * such a message instead.
+          */
+         if (!(smb2->session_flags & (SMB2_SESSION_FLAG_IS_GUEST | SMB2_SESSION_FLAG_IS_NULL)) &&
+             smb2->sign &&
+-            (smb2->hdr.flags & SMB2_FLAGS_SIGNED) &&
+-            (smb2->hdr.command != SMB2_SESSION_SETUP) ) {
++            (smb2->hdr.command != SMB2_NEGOTIATE) &&
++            (smb2->hdr.command != SMB2_SESSION_SETUP) &&
++            !smb2->enc) {
+                 uint8_t signature[16] _U_;
++
++                if (!(smb2->hdr.flags & SMB2_FLAGS_SIGNED)) {
++                        smb2_set_error(smb2, "PDU for command %d is not "
++                                       "signed but signing is required",
++                                       smb2->hdr.command);
++                        return -1;
++                }
+                 memcpy(&signature[0], &smb2->in.iov[1 + iov_offset].buf[48], 16);
+                 if (smb2_calc_signature(smb2, &smb2->in.iov[1 + iov_offset].buf[48],
+                                         &smb2->in.iov[1 + iov_offset],
+-- 
+2.56.0
+

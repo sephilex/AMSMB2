@@ -1,0 +1,115 @@
+From cc539bb7e0f41b366c92b1008ab81fd247e57bd0 Mon Sep 17 00:00:00 2001
+From: Ronnie Sahlberg <ronniesahlberg@gmail.com>
+Date: Fri, 14 Aug 2026 04:26:29 +1000
+Subject: [PATCH 6/9] Do not queue a zero length pad vector, and bound the
+ iovec skip loop
+
+smb2_read_data() computes the number of trailing bytes to skip as
+spl - in.num_done, and for an interim (STATUS_PENDING) reply or a reply
+we have no PDU for it queues a vector of that size and re-enters the read
+loop. A header-only reply - an SPL of exactly SMB2_HEADER_SIZE, which
+passes the SPL sanity check - makes that zero.
+
+A zero length vector leaves num_done equal to total_size, and the
+
+    while (num_done >= tmpiov->iov_len)
+
+skip loop at the top has no other terminating condition, so it steps past
+the last populated entry and starts reading iov_len out of uninitialised
+stack, walking past the end of iov[SMB2_MAX_VECTORS] for as long as it
+keeps finding zeros, before calling readv() with a negative iovcnt.
+
+Handle len == 0 at both sites instead of queueing an empty vector. The
+PENDING one finishes the interim reply where it stands rather than
+falling through the shared tail below, which requires at least two input
+vectors and would reject a decrypted header-only PDU, whose only vector
+is the header itself. Also reject a negative length at both sites, and
+make the skip loop itself stop at niov == 0 so a future caller can not
+reintroduce the walk.
+
+Verified by feeding a 64 byte STATUS_PENDING reply through
+smb2_read_from_buf() with spl == 64: before the change smb2_read_data()
+walks the work array, after it the PDU is consumed and the loop returns 0.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+(cherry picked from commit 09424faccbd377bc0bbd576f1fc20838ca483ab8)
+---
+ lib/socket.c | 51 +++++++++++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 49 insertions(+), 2 deletions(-)
+
+diff --git a/lib/socket.c b/lib/socket.c
+index 4669a65..bace197 100644
+--- a/lib/socket.c
++++ b/lib/socket.c
+@@ -354,12 +354,25 @@ read_more_data:
+         }
+         tmpiov = iov;
+ 
+-        /* Skip the vectors we have already read */
+-        while (num_done >= tmpiov->iov_len) {
++        /* Skip the vectors we have already read.
++         *
++         * The niov test is not redundant: a zero length vector, or a state
++         * where we have already read everything we asked for, makes this
++         * walk past the last populated entry and start reading iov_len out
++         * of uninitialised stack, for as long as it keeps finding zeros.
++         * Every caller below is supposed to have queued something left to
++         * read, so if there is nothing, that is a bug rather than an
++         * on-the-wire condition.
++         */
++        while (niov > 0 && num_done >= tmpiov->iov_len) {
+                 num_done -= tmpiov->iov_len;
+                 tmpiov++;
+                 niov--;
+         }
++        if (niov <= 0) {
++                smb2_set_error(smb2, "No io vectors left to read into");
++                return -1;
++        }
+ 
+         /* Adjust the first vector to read */
+         tmpiov->iov_base = (char *)tmpiov->iov_base + num_done;
+@@ -526,6 +539,40 @@ read_more_data:
+                         if (!has_xfrmhdr) {
+                                 len += SMB2_SPL_SIZE;
+                         }
++                        /*
++                         * A header-only interim response (an SPL of exactly
++                         * SMB2_HEADER_SIZE, which passes the SPL check
++                         * above) leaves no padding at all. Queueing a zero
++                         * length vector for it would leave num_done equal to
++                         * total_size and send the skip loop off the end of
++                         * the work array, so just finish the PDU here.
++                         */
++                        if (len < 0) {
++                                smb2_set_error(smb2, "Negative number of PAD "
++                                               "bytes in PENDING reply");
++                                return -1;
++                        }
++                        if (len == 0) {
++                                /* Nothing to skip, so this interim reply is
++                                 * already complete. Finish it here rather
++                                 * than falling through the shared tail
++                                 * below, which assumes at least two input
++                                 * vectors and would reject a decrypted
++                                 * header-only PDU, where the only vector is
++                                 * the header itself.
++                                 */
++                                if (smb2->passthrough) {
++                                        pdu = smb2_find_pdu(smb2,
++                                                        smb2->hdr.message_id);
++                                        if (pdu) {
++                                                pdu->cb(smb2, smb2->hdr.status,
++                                                        pdu->payload,
++                                                        pdu->cb_data);
++                                        }
++                                }
++                                smb2->in.num_done = 0;
++                                return 0;
++                        }
+                         /* Add padding before the next PDU */
+                         smb2->recv_state = SMB2_RECV_PAD;
+                         {
+-- 
+2.56.0
+

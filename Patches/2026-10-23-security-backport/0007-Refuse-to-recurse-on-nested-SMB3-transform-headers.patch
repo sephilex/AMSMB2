@@ -1,0 +1,93 @@
+From 5a0c9ca7b0bb665815a1baf5f7d30315e8d07c22 Mon Sep 17 00:00:00 2001
+From: Ronnie Sahlberg <ronniesahlberg@gmail.com>
+Date: Fri, 14 Aug 2026 04:27:04 +1000
+Subject: [PATCH 7/9] Refuse to recurse on nested SMB3 transform headers
+
+smb3_decrypt_pdu() feeds the decrypted payload back through the receive
+state machine, whose SMB2_RECV_HEADER case tests for the transform magic
+and calls smb3_decrypt_pdu() again on a match. Nothing capped how deep
+that could go, so a server could nest a transform header inside each
+successive plaintext and exhaust the stack; the 16MB PDU ceiling still
+leaves room for on the order of a hundred thousand levels.
+
+Each level also overwrites smb2->enc, smb2->enc_len and smb2->enc_pos,
+leaking the outer buffer and corrupting the outer read state, so even a
+single level of nesting is not something we can process correctly.
+
+SMB3 never nests transform headers, so track the depth on the context and
+reject anything past the first one.
+
+Requires a completed session, since every level has to carry a valid CCM
+tag, so this is a malicious-server DoS rather than a pre-auth one.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+(cherry picked from commit 7a970456c171152d033e4e02e540e00253aabd6a)
+---
+ include/libsmb2-private.h |  5 +++++
+ lib/smb3-seal.c           | 30 ++++++++++++++++++++++++++++--
+ 2 files changed, 33 insertions(+), 2 deletions(-)
+
+diff --git a/include/libsmb2-private.h b/include/libsmb2-private.h
+index f4bb87e..bf4342a 100644
+--- a/include/libsmb2-private.h
++++ b/include/libsmb2-private.h
+@@ -199,6 +199,11 @@ struct smb2_context {
+         unsigned char *enc;
+         size_t enc_len;
+         int enc_pos;
++        /* How many transform headers deep we currently are. SMB3 never
++         * nests them, so this only ever goes above 1 for a peer that is
++         * trying to recurse us off the end of the stack.
++         */
++        int enc_depth;
+ 
+         /*
+          * For sending PDUs
+diff --git a/lib/smb3-seal.c b/lib/smb3-seal.c
+index cde7be7..20b2118 100644
+--- a/lib/smb3-seal.c
++++ b/lib/smb3-seal.c
+@@ -124,8 +124,8 @@ smb3_encrypt_pdu(struct smb2_context *smb2,
+         return 0;
+ }
+ 
+-int
+-smb3_decrypt_pdu(struct smb2_context *smb2)
++static int
++smb3_do_decrypt_pdu(struct smb2_context *smb2)
+ {
+         int rc;
+ 
+@@ -177,3 +177,29 @@ smb3_decrypt_pdu(struct smb2_context *smb2)
+ 
+         return rc;
+ }
++
++int
++smb3_decrypt_pdu(struct smb2_context *smb2)
++{
++        int rc;
++
++        /*
++         * The decrypted payload is fed back through the same receive state
++         * machine, whose SMB2_RECV_HEADER case tests for the transform
++         * magic and calls us again on a match. SMB3 never nests transform
++         * headers, so a payload that contains one is a peer trying to
++         * recurse us off the end of the stack - and each level also
++         * overwrites smb2->enc, leaking the outer buffer and corrupting the
++         * outer read state. Refuse to go more than one deep.
++         */
++        if (smb2->enc_depth > 0) {
++                smb2_set_error(smb2, "Nested SMB3 transform header");
++                return -1;
++        }
++
++        smb2->enc_depth++;
++        rc = smb3_do_decrypt_pdu(smb2);
++        smb2->enc_depth--;
++
++        return rc;
++}
+-- 
+2.56.0
+
